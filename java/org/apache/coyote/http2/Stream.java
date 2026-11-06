@@ -24,7 +24,6 @@ import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
 import java.util.Collections;
 import java.util.Iterator;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
@@ -43,6 +42,7 @@ import org.apache.tomcat.util.buf.ByteChunk;
 import org.apache.tomcat.util.buf.MessageBytes;
 import org.apache.tomcat.util.http.MimeHeaders;
 import org.apache.tomcat.util.http.parser.Host;
+import org.apache.tomcat.util.http.parser.HttpParser;
 import org.apache.tomcat.util.net.ApplicationBufferHandler;
 import org.apache.tomcat.util.net.WriteBuffer;
 import org.apache.tomcat.util.res.StringManager;
@@ -342,10 +342,57 @@ class Stream extends AbstractStream implements HeaderEmitter {
                     name, value));
         }
 
-        // Header names must be lower case
-        if (!name.toLowerCase(Locale.US).equals(name)) {
-            throw new HpackException(sm.getString("stream.header.case",
-                    getConnectionId(), getIdentifier(), name));
+        // Validate field name. Field names must be tokens and must be lower
+        // case. Any violation is a stream error (rather than an HpackException
+        // which would trigger a connection error) and the remainder of the
+        // header block continues to be decoded so that the HPACK dynamic table
+        // remains in sync with the client.
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            // Skip pseudo headers
+            if (i == 0 && c == ':') {
+                continue;
+            }
+            if (!HttpParser.isToken(c) || Character.isUpperCase(c)) {
+                headerException = new StreamException(sm.getString(
+                        "stream.header.name.invalidCharacter", getConnectionId(), getIdentifier(),
+                        Character.toString(c), name), Http2Error.PROTOCOL_ERROR, getIdAsInt());
+                // No need for further processing. The stream will be reset.
+                return;
+            }
+        }
+
+        // Validate field value
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (i == 0) {
+                if (!HttpParser.isFieldVChar(c)) {
+                    headerException = new StreamException(sm.getString(
+                            "stream.header.value.invalidCharacter.start", getConnectionId(),
+                            getIdentifier(), Character.toString(c), value),
+                            Http2Error.PROTOCOL_ERROR, getIdAsInt());
+                    // No need for further processing. The stream will be reset.
+                    return;
+                }
+            } else if (i == value.length() - 1) {
+                if (!HttpParser.isFieldVChar(c)) {
+                    headerException = new StreamException(sm.getString(
+                            "stream.header.value.invalidCharacter.end", getConnectionId(),
+                            getIdentifier(), Character.toString(c), value),
+                            Http2Error.PROTOCOL_ERROR, getIdAsInt());
+                    // No need for further processing. The stream will be reset.
+                    return;
+                }
+            } else {
+                if (!HttpParser.isFieldContent(c)) {
+                    headerException = new StreamException(sm.getString(
+                            "stream.header.value.invalidCharacter", getConnectionId(),
+                            getIdentifier(), Character.toString(c), value),
+                            Http2Error.PROTOCOL_ERROR, getIdAsInt());
+                    // No need for further processing. The stream will be reset.
+                    return;
+                }
+            }
         }
 
         if ("connection".equals(name)) {
