@@ -251,31 +251,6 @@ public class TestHttp11Processor extends TomcatBaseTest {
 
 
     @Test
-    public void testWithTEIdentity() throws Exception {
-        getTomcatInstanceTestWebapp(false, true);
-
-        String request =
-            "POST /test/echo-params.jsp HTTP/1.1" + SimpleHttpClient.CRLF +
-            "Host: any" + SimpleHttpClient.CRLF +
-            "Transfer-encoding: identity" + SimpleHttpClient.CRLF +
-            "Content-Length: 9" + SimpleHttpClient.CRLF +
-            "Content-Type: application/x-www-form-urlencoded" +
-                    SimpleHttpClient.CRLF +
-            "Connection: close" + SimpleHttpClient.CRLF +
-                SimpleHttpClient.CRLF +
-            "test=data";
-
-        Client client = new Client(getPort());
-        client.setRequest(new String[] {request});
-
-        client.connect();
-        client.processRequest();
-        Assert.assertTrue(client.isResponse200());
-        Assert.assertTrue(client.getResponseBody().contains("test - data"));
-    }
-
-
-    @Test
     public void testWithTESavedRequest() throws Exception {
         getTomcatInstanceTestWebapp(false, true);
 
@@ -1642,5 +1617,214 @@ public class TestHttp11Processor extends TomcatBaseTest {
 
             out.print(" and request.getServerPort() is " + req.getServerPort());
         }
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown01() throws Exception {
+        doTestTEHeaderInvalid("identity", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown02() throws Exception {
+        doTestTEHeaderInvalid("identity, chunked", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown03() throws Exception {
+        doTestTEHeaderInvalid("unknown, chunked", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown04() throws Exception {
+        doTestTEHeaderInvalid("void", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown05() throws Exception {
+        doTestTEHeaderInvalid("void, chunked", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown06() throws Exception {
+        doTestTEHeaderInvalid("void, identity", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown07() throws Exception {
+        doTestTEHeaderInvalid("identity, void", false);
+    }
+
+
+    @Test
+    public void testTEHeaderChunkedNotLast01() throws Exception {
+        doTestTEHeaderInvalid("chunked, void", true);
+    }
+
+
+    /*
+     * Not in the upstream commit. chunked listed twice, chunked before
+     * identity and chunked followed by another header line must all be
+     * rejected, not just chunked followed by an unknown encoding.
+     */
+    @Test
+    public void testTEHeaderChunkedNotLast02() throws Exception {
+        doTestTEHeaderInvalid("chunked, chunked", true);
+    }
+
+
+    @Test
+    public void testTEHeaderChunkedNotLast03() throws Exception {
+        doTestTEHeaderInvalid("chunked, identity", true);
+    }
+
+
+    @Test
+    public void testTEHeaderChunkedNotLast04() throws Exception {
+        // Two header lines, the second one after chunked
+        doTestTEHeaderInvalid("chunked" + SimpleHttpClient.CRLF + "Transfer-Encoding: identity", true);
+    }
+
+
+    private void doTestTEHeaderInvalid(String headerValue, boolean badRequest) throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        // Add servlet
+        Tomcat.addServlet(ctx, "TesterServlet", new TesterServlet());
+        ctx.addServletMappingDecoded("/foo", "TesterServlet");
+
+        tomcat.start();
+
+        String request =
+                "GET /foo HTTP/1.1" + SimpleHttpClient.CRLF +
+                "Host: localhost:" + getPort() + SimpleHttpClient.CRLF +
+                "Transfer-Encoding: " + headerValue + SimpleHttpClient.CRLF +
+                SimpleHttpClient.CRLF;
+
+        Client client = new Client(tomcat.getConnector().getLocalPort());
+        client.setRequest(new String[] {request});
+
+        client.connect();
+        client.processRequest(false);
+
+        if (badRequest) {
+            Assert.assertTrue(client.isResponse400());
+        } else {
+            Assert.assertTrue(client.isResponse501());
+        }
+    }
+
+
+    /*
+     * The transfer-encoding header must not be silently ignored for an
+     * HTTP/1.0 request. The 9.0.48 fix processed it (HTTP/1.0 request with
+     * chunked body is served); upstream later (CVE-2026-77756, 9.0.122)
+     * rejects such a request with a 400 instead.
+     */
+    @Test
+    public void testWithTEChunkedHttp10() throws Exception {
+
+        getTomcatInstanceTestWebapp(false, true);
+
+        String request =
+            "POST /test/echo-params.jsp HTTP/1.0" + SimpleHttpClient.CRLF +
+            "Host: any" + SimpleHttpClient.CRLF +
+            "Transfer-encoding: chunked" + SimpleHttpClient.CRLF +
+            "Content-Type: application/x-www-form-urlencoded" +
+                    SimpleHttpClient.CRLF +
+            "Connection: close" + SimpleHttpClient.CRLF +
+            SimpleHttpClient.CRLF +
+            "9" + SimpleHttpClient.CRLF +
+            "test=data" + SimpleHttpClient.CRLF +
+            "0" + SimpleHttpClient.CRLF +
+            SimpleHttpClient.CRLF;
+
+        Client client = new Client(getPort());
+        client.setRequest(new String[] {request});
+
+        client.connect();
+        client.processRequest();
+        Assert.assertTrue(client.isResponse400());
+    }
+
+
+    /*
+     * Not in the upstream commit. The request-smuggling shape: HTTP/1.0 with
+     * both transfer-encoding and content-length. Previously the transfer-encoding
+     * header was ignored and the content-length used.
+     */
+    @Test
+    public void testWithTEChunkedWithCLHttp10() throws Exception {
+
+        getTomcatInstanceTestWebapp(false, true);
+
+        String request =
+            "POST /test/echo-params.jsp HTTP/1.0" + SimpleHttpClient.CRLF +
+            "Host: any" + SimpleHttpClient.CRLF +
+            "Content-Length: 9" + SimpleHttpClient.CRLF +
+            "Transfer-encoding: chunked" + SimpleHttpClient.CRLF +
+            "Content-Type: application/x-www-form-urlencoded" +
+                    SimpleHttpClient.CRLF +
+            "Connection: close" + SimpleHttpClient.CRLF +
+            SimpleHttpClient.CRLF +
+            "test=data";
+
+        Client client = new Client(getPort());
+        client.setRequest(new String[] {request});
+
+        client.connect();
+        client.processRequest();
+        Assert.assertTrue(client.isResponse400());
+    }
+
+
+    /*
+     * Not in the upstream commit. The transfer-encoding header must not be
+     * ignored for an HTTP/1.1 request from a client that matches
+     * restrictedUserAgents (which downgrades the request to HTTP/1.0 handling).
+     */
+    @Test
+    public void testWithTEChunkedRestrictedUserAgent() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        Tomcat.addServlet(ctx, "TesterServlet", new TesterServlet());
+        ctx.addServletMappingDecoded("/foo", "TesterServlet");
+
+        Assert.assertTrue(tomcat.getConnector().setProperty("restrictedUserAgents", "MSIE"));
+
+        tomcat.start();
+
+        String request =
+                "POST /foo HTTP/1.1" + SimpleHttpClient.CRLF +
+                "Host: localhost:" + getPort() + SimpleHttpClient.CRLF +
+                "User-Agent: MSIE" + SimpleHttpClient.CRLF +
+                "Transfer-Encoding: chunked" + SimpleHttpClient.CRLF +
+                "Content-Type: application/x-www-form-urlencoded" + SimpleHttpClient.CRLF +
+                "Connection: close" + SimpleHttpClient.CRLF +
+                SimpleHttpClient.CRLF +
+                "9" + SimpleHttpClient.CRLF +
+                "test=data" + SimpleHttpClient.CRLF +
+                "0" + SimpleHttpClient.CRLF +
+                SimpleHttpClient.CRLF;
+
+        Client client = new Client(tomcat.getConnector().getLocalPort());
+        client.setRequest(new String[] {request});
+
+        client.connect();
+        client.processRequest(false);
+
+        Assert.assertTrue(client.isResponse400());
     }
 }

@@ -208,14 +208,21 @@ public class Http11Processor extends AbstractProcessor {
      * supported, a 501 response will be returned to the client.
      */
     private void addInputFilter(InputFilter[] inputFilters, String encodingName) {
+        if (contentDelimitation) {
+            // Chunked has already been specified and it must be the final
+            // encoding.
+            // 400 - Bad request
+            response.setStatus(400);
+            setErrorState(ErrorState.CLOSE_CLEAN, null);
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("http11processor.request.alreadyChunked", encodingName));
+            }
+            return;
+        }
 
         // Parsing trims and converts to lower case.
-
-        if (encodingName.equals("identity")) {
-            // Skip
-        } else if (encodingName.equals("chunked")) {
-            inputBuffer.addActiveFilter
-                (inputFilters[Constants.CHUNKED_FILTER]);
+        if (encodingName.equals("chunked")) {
+            inputBuffer.addActiveFilter(inputFilters[Constants.CHUNKED_FILTER]);
             contentDelimitation = true;
         } else {
             for (int i = pluggableFilterIndex; i < inputFilters.length; i++) {
@@ -737,19 +744,23 @@ public class Http11Processor extends AbstractProcessor {
         InputFilter[] inputFilters = inputBuffer.getFilters();
 
         // Parse transfer-encoding header
-        if (http11) {
-            MessageBytes transferEncodingValueMB = headers.getValue("transfer-encoding");
-            if (transferEncodingValueMB != null) {
+        MessageBytes transferEncodingValueMB = headers.getValue("transfer-encoding");
+        if (transferEncodingValueMB != null) {
+            if (http11) {
                 List<String> encodingNames = new ArrayList<>();
                 if (TokenList.parseTokenList(headers.values("transfer-encoding"), encodingNames)) {
                     for (String encodingName : encodingNames) {
-                        // "identity" codings are ignored
                         addInputFilter(inputFilters, encodingName);
                     }
                 } else {
                     // Invalid transfer encoding
                     badRequest("http11processor.request.invalidTransferEncoding");
                 }
+            } else {
+                // Transfer-Encoding is not defined for HTTP/1.0 (or earlier).
+                // Ignoring it would let a front-end proxy and Tomcat disagree
+                // on where the request body ends so reject the request.
+                badRequest("http11processor.request.transferEncodingWithHttp10");
             }
         }
 
