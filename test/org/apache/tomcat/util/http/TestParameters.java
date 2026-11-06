@@ -174,6 +174,16 @@ public class TestParameters {
     }
 
     @Test
+    public void testSize() {
+        Parameters p = new Parameters();
+        Assert.assertEquals(0, p.size());
+        p.addParameter("foo1", "value1");
+        Assert.assertEquals(1, p.size());
+        p.addParameter("foo2", "value2");
+        Assert.assertEquals(2, p.size());
+    }
+
+    @Test
     public void testAddParametersLimit() {
         Parameters p = new Parameters();
 
