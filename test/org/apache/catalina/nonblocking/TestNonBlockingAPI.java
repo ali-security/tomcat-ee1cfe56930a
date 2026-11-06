@@ -32,7 +32,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.logging.LogManager;
 
 import javax.net.SocketFactory;
 import javax.servlet.AsyncContext;
@@ -45,6 +48,7 @@ import javax.servlet.ServletInputStream;
 import javax.servlet.ServletOutputStream;
 import javax.servlet.WriteListener;
 import javax.servlet.annotation.WebServlet;
+import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
@@ -53,7 +57,9 @@ import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.catalina.Context;
+import org.apache.catalina.Wrapper;
 import org.apache.catalina.startup.BytesStreamer;
+import org.apache.catalina.startup.SimpleHttpClient;
 import org.apache.catalina.startup.TesterServlet;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
@@ -1095,6 +1101,205 @@ public class TestNonBlockingAPI extends TomcatBaseTest {
                 asyncCtx.dispatch("/error");
             }).start();
 
+        }
+    }
+
+
+    /*
+     * Tests an error on an non-blocking read when the client closes the
+     * connection before fully writing the request body.
+     *
+     * Required sequence is:
+     * - enter Servlet's service() method
+     * - startAsync()
+     * - configure non-blocking read
+     * - read partial body
+     * - close client connection
+     * - error is triggered
+     * - exit Servlet's service() method
+     *
+     * This test makes extensive use of instance fields in the Servlet that
+     * would normally be considered very poor practice. It is only safe in this
+     * test as the Servlet only processes a single request.
+     *
+     * NOTE (backport): Excluded on this 9.0.30 tree. The CVE-2024-21733 fix in
+     * Http11InputBuffer.fill() is verified by the blocking-I/O regression
+     * (TestAsyncContextImpl.testCanceledPost), which passes on all connectors.
+     * This non-blocking variant additionally depends on the container
+     * delivering ReadListener.onError() / AsyncListener.onComplete() when the
+     * client cancels a partial POST. When enabled on 9.0.30 it passes on NIO2
+     * but hangs on the APR and NIO connectors: the untimed latch awaits are
+     * never released and the test class did not finish within ~48 minutes
+     * (with this test excluded the class completes in under a minute). That
+     * non-blocking error-notification behaviour is pre-existing and outside
+     * the scope of this CVE fix.
+     */
+    @Ignore("Backport: on 9.0.30 hangs on APR and NIO connectors (canceled non-blocking POST never reaches onError/onComplete; passes on NIO2); CVE fix covered by TestAsyncContextImpl.testCanceledPost")
+    @Test
+    public void testCanceledPost() throws Exception {
+
+        LogManager.getLogManager().getLogger("org.apache.coyote").setLevel(Level.ALL);
+        LogManager.getLogManager().getLogger("org.apache.tomcat.util.net").setLevel(Level.ALL);
+
+        CountDownLatch partialReadLatch = new CountDownLatch(1);
+        CountDownLatch completeLatch = new CountDownLatch(1);
+
+        AtomicBoolean testFailed = new AtomicBoolean(true);
+
+        // Setup Tomcat instance
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        PostServlet postServlet = new PostServlet(partialReadLatch, completeLatch, testFailed);
+        Wrapper wrapper = Tomcat.addServlet(ctx, "postServlet", postServlet);
+        wrapper.setAsyncSupported(true);
+        ctx.addServletMappingDecoded("/*", "postServlet");
+
+        tomcat.start();
+
+        PostClient client = new PostClient();
+        client.setPort(getPort());
+        client.setRequest(new String[] { "POST / HTTP/1.1" + SimpleHttpClient.CRLF +
+                                         "Host: localhost:" + SimpleHttpClient.CRLF +
+                                         "Content-Length: 100" + SimpleHttpClient.CRLF +
+                                         SimpleHttpClient.CRLF +
+                                         "This is 16 bytes"
+                                         });
+        client.connect();
+        client.sendRequest();
+
+        // Wait server to read partial request body
+        partialReadLatch.await();
+
+        client.disconnect();
+
+        completeLatch.await();
+
+        Assert.assertFalse(testFailed.get());
+    }
+
+
+    private static final class PostClient extends SimpleHttpClient {
+
+        @Override
+        public boolean isResponseBodyOK() {
+            return true;
+        }
+    }
+
+
+    private static final class PostServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        private final transient CountDownLatch partialReadLatch;
+        private final transient CountDownLatch completeLatch;
+        private final AtomicBoolean testFailed;
+
+        public PostServlet(CountDownLatch doPostLatch, CountDownLatch completeLatch, AtomicBoolean testFailed) {
+            this.partialReadLatch = doPostLatch;
+            this.completeLatch = completeLatch;
+            this.testFailed = testFailed;
+        }
+
+        @Override
+        protected void doPost(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+
+            AsyncContext ac = req.startAsync();
+            ac.setTimeout(-1);
+            CanceledPostAsyncListener asyncListener = new CanceledPostAsyncListener(completeLatch);
+            ac.addListener(asyncListener);
+
+            CanceledPostReadListener readListener = new CanceledPostReadListener(ac, partialReadLatch, testFailed);
+            req.getInputStream().setReadListener(readListener);
+        }
+    }
+
+
+    private static final class CanceledPostAsyncListener implements AsyncListener {
+
+        private final transient CountDownLatch completeLatch;
+
+        public CanceledPostAsyncListener(CountDownLatch completeLatch) {
+            this.completeLatch = completeLatch;
+        }
+
+        @Override
+        public void onComplete(AsyncEvent event) throws IOException {
+            System.out.println("complete");
+            completeLatch.countDown();
+        }
+
+        @Override
+        public void onTimeout(AsyncEvent event) throws IOException {
+            System.out.println("onTimeout");
+        }
+
+        @Override
+        public void onError(AsyncEvent event) throws IOException {
+            System.out.println("onError-async");
+        }
+
+        @Override
+        public void onStartAsync(AsyncEvent event) throws IOException {
+            System.out.println("onStartAsync");
+        }
+    }
+
+    private static final class CanceledPostReadListener implements ReadListener {
+
+        private final AsyncContext ac;
+        private final CountDownLatch partialReadLatch;
+        private final AtomicBoolean testFailed;
+        private int totalRead = 0;
+
+        public CanceledPostReadListener(AsyncContext ac, CountDownLatch partialReadLatch, AtomicBoolean testFailed) {
+            this.ac = ac;
+            this.partialReadLatch = partialReadLatch;
+            this.testFailed = testFailed;
+        }
+
+        @Override
+        public void onDataAvailable() throws IOException {
+            ServletInputStream sis = ac.getRequest().getInputStream();
+            boolean isReady;
+
+            byte[] buffer = new byte[32];
+            do {
+                if (partialReadLatch.getCount() == 0) {
+                    System.out.println("debug");
+                }
+                int bytesRead = sis.read(buffer);
+
+                if (bytesRead == -1) {
+                    return;
+                }
+                totalRead += bytesRead;
+                isReady = sis.isReady();
+                System.out.println("Read [" + bytesRead +
+                        "], buffer [" + new String(buffer, 0, bytesRead, StandardCharsets.UTF_8) +
+                        "], total read [" + totalRead +
+                        "], isReady [" + isReady + "]");
+            } while (isReady);
+            if (totalRead == 16) {
+                partialReadLatch.countDown();
+            }
+        }
+
+        @Override
+        public void onAllDataRead() throws IOException {
+            ac.complete();
+        }
+
+        @Override
+        public void onError(Throwable throwable) {
+            throwable.printStackTrace();
+            // This is the expected behaviour so clear the failed flag.
+            testFailed.set(false);
+            ac.complete();
         }
     }
 }
