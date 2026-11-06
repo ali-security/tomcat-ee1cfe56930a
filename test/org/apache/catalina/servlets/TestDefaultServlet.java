@@ -87,6 +87,83 @@ public class TestDefaultServlet extends TomcatBaseTest {
     }
 
     /*
+     * The globalXsltFile init parameter is only permitted to reference a file
+     * located within CATALINA_BASE/conf (or CATALINA_HOME/conf). The check used
+     * to be a String prefix comparison of the two canonical paths so, since the
+     * canonical path of the conf directory has no trailing separator, a sibling
+     * directory of conf whose name simply started with "conf" was incorrectly
+     * accepted. See CVE-2021-25329.
+     */
+    @Test
+    public void testGlobalXsltFileInSiblingOfConf() throws Exception {
+        final String marker = "XSLT-FROM-OUTSIDE-CONF";
+
+        File confDir = new File(getTemporaryDirectory(), "conf");
+        addDeleteOnTearDown(confDir);
+        if (!confDir.mkdirs() && !confDir.isDirectory()) {
+            Assert.fail("Unable to create directory [" + confDir + "]");
+        }
+
+        // Sibling of conf. Its name starts with the name of the conf directory.
+        File siblingDir = new File(getTemporaryDirectory(), "confevil");
+        addDeleteOnTearDown(siblingDir);
+        if (!siblingDir.mkdirs() && !siblingDir.isDirectory()) {
+            Assert.fail("Unable to create directory [" + siblingDir + "]");
+        }
+
+        File xsltFile = new File(siblingDir, "evil.xsl");
+        try (FileOutputStream fos = new FileOutputStream(xsltFile);
+                Writer w = new OutputStreamWriter(fos, "UTF-8")) {
+            w.write("<?xml version='1.0' encoding='UTF-8'?>\n"
+                    + "<xsl:stylesheet"
+                    + " xmlns:xsl='http://www.w3.org/1999/XSL/Transform'"
+                    + " version='1.0'>\n"
+                    + "<xsl:output method='text'/>\n"
+                    + "<xsl:template match='/'>" + marker + "</xsl:template>\n"
+                    + "</xsl:stylesheet>\n");
+        }
+
+        File appDir = new File(getTemporaryDirectory(), "MyXsltApp");
+        File listedDir = new File(appDir, "listed");
+        addDeleteOnTearDown(appDir);
+        if (!listedDir.mkdirs() && !listedDir.isDirectory()) {
+            Assert.fail("Unable to create directory [" + listedDir + "]");
+        }
+        File listedFile = new File(listedDir, "entry.txt");
+        if (!listedFile.createNewFile() && !listedFile.isFile()) {
+            Assert.fail("Unable to create file [" + listedFile + "]");
+        }
+
+        Tomcat tomcat = getTomcatInstance();
+        Context ctxt = tomcat.addContext("", appDir.getAbsolutePath());
+        Wrapper defaultServlet = Tomcat.addServlet(ctxt, "default",
+                "org.apache.catalina.servlets.DefaultServlet");
+        defaultServlet.addInitParameter("listings", "true");
+        // Escapes from conf into the sibling directory
+        defaultServlet.addInitParameter("globalXsltFile",
+                ".." + File.separator + "confevil" + File.separator + "evil.xsl");
+        ctxt.addServletMappingDecoded("/", "default");
+
+        tomcat.start();
+
+        // Confirm the exploited path really does defeat a String prefix check,
+        // i.e. that this test exercises the CVE-2021-25329 vector
+        File candidate = new File(confDir,
+                ".." + File.separator + "confevil" + File.separator + "evil.xsl");
+        Assert.assertTrue(candidate.getCanonicalPath().startsWith(confDir.getCanonicalPath()));
+
+        ByteChunk res = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + "/listed/", res, null);
+        Assert.assertEquals(HttpServletResponse.SC_OK, rc);
+
+        String body = res.toString();
+        Assert.assertFalse("An XSLT file located outside of conf was used to render the"
+                + " directory listing", body.contains(marker));
+        // The standard HTML listing must have been used instead
+        Assert.assertTrue(body.contains("entry.txt"));
+    }
+
+    /*
      * Verify serving of gzipped resources from context root.
      */
     @Test

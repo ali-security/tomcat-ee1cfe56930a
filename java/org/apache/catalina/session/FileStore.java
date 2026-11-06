@@ -33,6 +33,7 @@ import org.apache.catalina.Context;
 import org.apache.catalina.Globals;
 import org.apache.catalina.Session;
 import org.apache.juli.logging.Log;
+import org.apache.juli.logging.LogFactory;
 
 /**
  * Concrete implementation of the <b>Store</b> interface that utilizes
@@ -42,6 +43,8 @@ import org.apache.juli.logging.Log;
  * @author Craig R. McClanahan
  */
 public final class FileStore extends StoreBase {
+
+    private static final Log log = LogFactory.getLog(FileStore.class);
 
     // ----------------------------------------------------- Constants
 
@@ -336,11 +339,21 @@ public final class FileStore extends StoreBase {
      *    used in the file naming.
      */
     private File file(String id) throws IOException {
-        if (this.directory == null) {
+        File storageDir = directory();
+        if (storageDir == null) {
             return null;
         }
+
         String filename = id + FILE_EXT;
-        File file = new File(directory(), filename);
-        return file;
+        File file = new File(storageDir, filename);
+        File canonicalFile = file.getCanonicalFile();
+
+        // Check the file is within the storage directory
+        if (!canonicalFile.toPath().startsWith(storageDir.getCanonicalFile().toPath())) {
+            log.warn(sm.getString("fileStore.invalid", file.getPath(), id));
+            return null;
+        }
+
+        return canonicalFile;
     }
 }

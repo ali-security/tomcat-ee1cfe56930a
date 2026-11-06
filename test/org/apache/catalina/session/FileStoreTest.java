@@ -19,7 +19,7 @@ package org.apache.catalina.session;
 import java.io.File;
 import java.io.IOException;
 
-import org.junit.AfterClass;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -50,8 +50,8 @@ public class FileStoreTest {
     }
 
 
-    @AfterClass
-    public static void cleanup() throws IOException {
+    @After
+    public void cleanup() throws IOException {
         FileUtils.cleanDirectory(dir);
         FileUtils.deleteDirectory(dir);
     }
