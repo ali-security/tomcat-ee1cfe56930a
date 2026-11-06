@@ -143,16 +143,18 @@ public class TestRequestPostSizeOverflow extends TomcatBaseTest {
     }
 
     /**
-     * Where an earlier part is within maxPostSize that part may be published,
-     * but the part that exceeds the limit must not be.
+     * The part that exceeds the limit must not be published even where an
+     * earlier part was within maxPostSize. Since a failed multi-part request is
+     * now cleaned up as soon as the failure is known, the earlier part is not
+     * left on the request either.
      */
     @Test
-    public void testOnlyPartsWithinTheLimitAreExposed() throws Exception {
+    public void testNoPartsAreExposedWhenALaterPartExceedsTheLimit() throws Exception {
         // The equivalent sizes are 2 + 1 + 4 + 1 == 8 and 2 + 1 + 64 + 1 == 68
         String body = doMultipartRequest(30, new int[] { 4, 64 });
 
         Assert.assertTrue(body, body.contains("getParts=IllegalStateException"));
-        Assert.assertEquals(body, "published=1", getPublished(body));
+        Assert.assertEquals(body, "published=0", getPublished(body));
     }
 
     /**
