@@ -20,6 +20,7 @@ package org.apache.catalina.realm;
 import java.security.Principal;
 import java.security.cert.X509Certificate;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -78,6 +79,12 @@ public class LockOutRealm extends CombinedRealm {
      * in access order from least recent to most recent.
      */
     protected Map<String,LockRecord> failedUsers = null;
+
+    /*
+     * Should user names (the keys) in the failedUsers Map be treated in a case
+     * sensitive manner. The default is false.
+     */
+    private boolean caseSensitive = false;
 
 
     /**
@@ -255,6 +262,7 @@ public class LockOutRealm extends CombinedRealm {
      * attempt to authenticated a locked user will log a warning.
      */
     public boolean isLocked(String username) {
+        username = normalizeUsername(username);
         LockRecord lockRecord = null;
         synchronized (this) {
             lockRecord = failedUsers.get(username);
@@ -283,7 +291,7 @@ public class LockOutRealm extends CombinedRealm {
      */
     private synchronized void registerAuthSuccess(String username) {
         // Successful authentication means removal from the list of failed users
-        failedUsers.remove(username);
+        failedUsers.remove(normalizeUsername(username));
     }
 
 
@@ -292,6 +300,7 @@ public class LockOutRealm extends CombinedRealm {
      * authentication.
      */
     private void registerAuthFailure(String username) {
+        username = normalizeUsername(username);
         LockRecord lockRecord = null;
         synchronized (this) {
             if (!failedUsers.containsKey(username)) {
@@ -390,6 +399,24 @@ public class LockOutRealm extends CombinedRealm {
      */
     public void setCacheRemovalWarningTime(int cacheRemovalWarningTime) {
         this.cacheRemovalWarningTime = cacheRemovalWarningTime;
+    }
+
+
+    public boolean getCaseSensitive() {
+        return caseSensitive;
+    }
+
+
+    public void setCaseSensitive(boolean caseSensitive) {
+        this.caseSensitive = caseSensitive;
+    }
+
+
+    private String normalizeUsername(String username) {
+        if (username != null && !getCaseSensitive()) {
+            return username.toLowerCase(Locale.ROOT);
+        }
+        return username;
     }
 
 
