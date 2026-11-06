@@ -47,8 +47,11 @@ public class TestDigestAuthenticator extends TomcatBaseTest {
 
     private static String USER = "user";
     private static String PWD = "pwd";
+    private static String UNKNOWN_USER = "invalid";
     private static String ROLE = "role";
     private static String URI = "/protected";
+    // Protected by role-name "**" so any authenticated user is authorized
+    private static String URI_ANY_ROLE = "/protected-any";
     private static String QUERY = "?foo=bar";
     private static String CONTEXT_PATH = "/foo";
     private static String CLIENT_AUTH_HEADER = "authorization";
@@ -181,6 +184,37 @@ public class TestDigestAuthenticator extends TomcatBaseTest {
                 NC1, NC1, CNONCE, QOP, true, false);
     }
 
+    @Test
+    public void testAllValidAnyRole() throws Exception {
+        doTest(USER, PWD, CONTEXT_PATH + URI_ANY_ROLE, false, true, REALM, true,
+                true, NC1, NC2, CNONCE, QOP, true, true);
+    }
+
+    /*
+     * A user that does not exist in the Realm has no password. If that unknown
+     * password is included in the digest calculation as the literal text "null"
+     * then an attacker can calculate a digest that the server accepts and be
+     * authenticated as an arbitrary, unknown user. The resource used by this
+     * test is protected with role-name "**" so any authenticated user is
+     * authorized. That makes this test sensitive to the authentication result
+     * rather than to the authorization result.
+     */
+    @Test
+    public void testUnknownUserWithNullPassword() throws Exception {
+        doTest(UNKNOWN_USER, "null", CONTEXT_PATH + URI_ANY_ROLE, false, true,
+                REALM, true, true, NC1, NC2, CNONCE, QOP, false, false);
+    }
+
+    /*
+     * As above but for a known user. The known user has a password so the
+     * literal text "null" must not be accepted as that password.
+     */
+    @Test
+    public void testValidUserWithNullPassword() throws Exception {
+        doTest(USER, "null", CONTEXT_PATH + URI_ANY_ROLE, false, true, REALM,
+                true, true, NC1, NC2, CNONCE, QOP, false, false);
+    }
+
     public void doTest(String user, String pwd, String uri, boolean breakUri,
             boolean validateUri, String realm, boolean useServerNonce,
             boolean useServerOpaque, String nc1, String nc2, String cnonce,
@@ -280,6 +314,18 @@ public class TestDigestAuthenticator extends TomcatBaseTest {
         sc.addAuthRole(ROLE);
         sc.addCollection(collection);
         ctxt.addConstraint(sc);
+
+        // Add a second protected servlet where authentication alone is
+        // sufficient for authorization. This allows tests to distinguish
+        // between authentication and authorization failures.
+        ctxt.addServletMappingDecoded(URI_ANY_ROLE, "TesterServlet");
+        SecurityCollection collectionAnyRole = new SecurityCollection();
+        collectionAnyRole.addPatternDecoded(URI_ANY_ROLE);
+        SecurityConstraint scAnyRole = new SecurityConstraint();
+        scAnyRole.setAuthConstraint(true);
+        scAnyRole.addAuthRole(SecurityConstraint.ROLE_ALL_AUTHENTICATED_USERS);
+        scAnyRole.addCollection(collectionAnyRole);
+        ctxt.addConstraint(scAnyRole);
 
         // Configure the Realm
         TesterMapRealm realm = new TesterMapRealm();
