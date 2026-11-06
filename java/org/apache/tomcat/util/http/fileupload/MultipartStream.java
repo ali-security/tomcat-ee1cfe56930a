@@ -23,6 +23,7 @@ import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
 
 import org.apache.tomcat.util.http.fileupload.impl.FileUploadIOException;
+import org.apache.tomcat.util.http.fileupload.impl.SizeLimitExceededException;
 import org.apache.tomcat.util.http.fileupload.util.Closeable;
 import org.apache.tomcat.util.http.fileupload.util.Streams;
 
@@ -265,6 +266,12 @@ public class MultipartStream {
      */
     private final ProgressNotifier notifier;
 
+    /**
+     * The maximum permitted size, in bytes, of the headers for an individual
+     * part. A value of -1 indicates no maximum.
+     */
+    private int partHeaderSizeMax = FileUploadBase.DEFAULT_PART_HEADER_SIZE_MAX;
+
     // ----------------------------------------------------------- Constructors
 
     /**
@@ -360,6 +367,27 @@ public class MultipartStream {
      */
     public void setHeaderEncoding(String encoding) {
         headerEncoding = encoding;
+    }
+
+    /**
+     * Returns the maximum permitted size, in bytes, of the headers for an
+     * individual part.
+     *
+     * @return The maximum permitted size, in bytes, of the headers for an
+     *         individual part. A value of -1 indicates no maximum.
+     */
+    public int getPartHeaderSizeMax() {
+        return partHeaderSizeMax;
+    }
+
+    /**
+     * Sets the maximum permitted size, in bytes, of the headers for an
+     * individual part.
+     *
+     * @param partHeaderSizeMax The new limit. {@code -1} means no limit.
+     */
+    public void setPartHeaderSizeMax(int partHeaderSizeMax) {
+        this.partHeaderSizeMax = partHeaderSizeMax;
     }
 
     /**
@@ -519,10 +547,12 @@ public class MultipartStream {
             } catch (IOException e) {
                 throw new MalformedStreamException("Stream ended unexpectedly");
             }
-            if (++size > HEADER_PART_SIZE_MAX) {
-                throw new MalformedStreamException(String.format(
+            size++;
+            if (partHeaderSizeMax != -1 && size > partHeaderSizeMax) {
+                throw new FileUploadIOException(new SizeLimitExceededException(String.format(
                         "Header section has more than %s bytes (maybe it is not properly terminated)",
-                        Integer.valueOf(HEADER_PART_SIZE_MAX)));
+                        Integer.valueOf(partHeaderSizeMax)),
+                        size, partHeaderSizeMax));
             }
             if (b == HEADER_SEPARATOR[i]) {
                 i++;
