@@ -24,6 +24,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.coyote.BadRequestException;
 import org.apache.coyote.InputBuffer;
 import org.apache.coyote.Request;
 import org.apache.coyote.http11.Constants;
@@ -165,7 +166,7 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
 
         if (remaining <= 0) {
             if (!parseChunkHeader()) {
-                throwIOException(sm.getString("chunkedInputFilter.invalidHeader"));
+                throwBadRequestException(sm.getString("chunkedInputFilter.invalidHeader"));
             }
             if (endChunk) {
                 parseEndChunk();
@@ -177,7 +178,7 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
 
         if (readChunk == null || readChunk.position() >= readChunk.limit()) {
             if (readBytes() < 0) {
-                throwIOException(sm.getString("chunkedInputFilter.eos"));
+                throwBadRequestException(sm.getString("chunkedInputFilter.eos"));
             }
         }
 
@@ -232,7 +233,7 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
         while ((read = doRead(this)) >= 0) {
             swallowed += read;
             if (maxSwallowSize > -1 && swallowed > maxSwallowSize) {
-                throwIOException(sm.getString("inputFilter.maxSwallow"));
+                throwBadRequestException(sm.getString("inputFilter.maxSwallow"));
             }
         }
 
@@ -339,7 +340,7 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
                 try {
                     extensionState = ChunkExtension.parse(chr, extensionState);
                 } catch (IOException ioe) {
-                    throwIOException(sm.getString("chunkedInputFilter.invalidHeader"));
+                    throwBadRequestException(sm.getString("chunkedInputFilter.invalidHeader"));
                 }
                 if (extensionState == State.CR) {
                     extensionState = null;
@@ -349,7 +350,7 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
                     // Check the size
                     long extSize = ++extensionSize;
                     if (maxExtensionSize > -1 && extSize > maxExtensionSize) {
-                        throwIOException(sm.getString("chunkedInputFilter.maxExtension"));
+                        throwBadRequestException(sm.getString("chunkedInputFilter.maxExtension"));
                     }
                 }
             } else if (chr == Constants.CR || chr == Constants.LF) {
@@ -363,7 +364,7 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
                 extensionState = State.PRE_NAME;
                 long extSize = ++extensionSize;
                 if (maxExtensionSize > -1 && extSize > maxExtensionSize) {
-                    throwIOException(sm.getString("chunkedInputFilter.maxExtension"));
+                    throwBadRequestException(sm.getString("chunkedInputFilter.maxExtension"));
                 }
             } else {
                 //don't read data after the trailer
@@ -413,23 +414,23 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
         while (!eol) {
             if (readChunk == null || readChunk.position() >= readChunk.limit()) {
                 if (readBytes() <= 0) {
-                    throwIOException(sm.getString("chunkedInputFilter.invalidCrlfNoData"));
+                    throwBadRequestException(sm.getString("chunkedInputFilter.invalidCrlfNoData"));
                 }
             }
 
             byte chr = readChunk.get(readChunk.position());
             if (chr == Constants.CR) {
                 if (crfound) {
-                    throwIOException(sm.getString("chunkedInputFilter.invalidCrlfCRCR"));
+                    throwBadRequestException(sm.getString("chunkedInputFilter.invalidCrlfCRCR"));
                 }
                 crfound = true;
             } else if (chr == Constants.LF) {
                 if (!tolerant && !crfound) {
-                    throwIOException(sm.getString("chunkedInputFilter.invalidCrlfNoCR"));
+                    throwBadRequestException(sm.getString("chunkedInputFilter.invalidCrlfNoCR"));
                 }
                 eol = true;
             } else {
-                throwIOException(sm.getString("chunkedInputFilter.invalidCrlf"));
+                throwBadRequestException(sm.getString("chunkedInputFilter.invalidCrlf"));
             }
 
             readChunk.position(readChunk.position() + 1);
@@ -506,7 +507,7 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
                 colon = true;
             } else if (!HttpParser.isToken(chr)) {
                 // Non-token characters are illegal in header names
-                throwIOException(sm.getString("chunkedInputFilter.invalidTrailerHeaderName"));
+                throwBadRequestException(sm.getString("chunkedInputFilter.invalidTrailerHeaderName"));
             } else {
                 trailingHeaders.append(chr);
             }
@@ -545,7 +546,7 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
                     // limit placed on trailing header size
                     int newlimit = trailingHeaders.getLimit() -1;
                     if (trailingHeaders.getEnd() > newlimit) {
-                        throwIOException(sm.getString("chunkedInputFilter.maxTrailer"));
+                        throwBadRequestException(sm.getString("chunkedInputFilter.maxTrailer"));
                     }
                     trailingHeaders.setLimit(newlimit);
                 } else {
@@ -569,7 +570,7 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
                     parseCRLF(true);
                     eol = true;
                 } else if (HttpParser.isControl(chr) && chr != Constants.HT) {
-                    throwIOException(sm.getString("chunkedInputFilter.invalidTrailerHeaderValue"));
+                    throwBadRequestException(sm.getString("chunkedInputFilter.invalidTrailerHeaderValue"));
                 } else if (chr == Constants.SP || chr == Constants.HT) {
                     trailingHeaders.append(chr);
                 } else {
@@ -621,9 +622,9 @@ public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler
     }
 
 
-    private void throwIOException(String msg) throws IOException {
+    private void throwBadRequestException(String msg) throws IOException {
         error = true;
-        throw new IOException(msg);
+        throw new BadRequestException(msg);
     }
 
 

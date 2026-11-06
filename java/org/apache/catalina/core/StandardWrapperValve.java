@@ -37,6 +37,7 @@ import org.apache.catalina.connector.ClientAbortException;
 import org.apache.catalina.connector.Request;
 import org.apache.catalina.connector.Response;
 import org.apache.catalina.valves.ValveBase;
+import org.apache.coyote.BadRequestException;
 import org.apache.coyote.CloseNowException;
 import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.buf.MessageBytes;
@@ -204,6 +205,14 @@ final class StandardWrapperValve
                 }
 
             }
+        } catch (BadRequestException e) {
+            if (container.getLogger().isDebugEnabled()) {
+                container.getLogger().debug(sm.getString(
+                        "standardWrapper.serviceException", wrapper.getName(),
+                        context.getName()), e);
+            }
+            throwable = e;
+            exception(request, response, e, HttpServletResponse.SC_BAD_REQUEST);
         } catch (ClientAbortException | CloseNowException e) {
             if (container.getLogger().isDebugEnabled()) {
                 container.getLogger().debug(sm.getString(
@@ -316,8 +325,14 @@ final class StandardWrapperValve
      */
     private void exception(Request request, Response response,
                            Throwable exception) {
+        exception(request, response, exception, HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+    }
+
+
+    private void exception(Request request, Response response,
+                           Throwable exception, int errorCode) {
         request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, exception);
-        response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+        response.setStatus(errorCode);
         response.setError();
     }
 

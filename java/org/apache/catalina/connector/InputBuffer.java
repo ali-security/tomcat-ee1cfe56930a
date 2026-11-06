@@ -30,9 +30,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.servlet.ReadListener;
+import javax.servlet.RequestDispatcher;
 
 import org.apache.catalina.security.SecurityUtil;
 import org.apache.coyote.ActionCode;
+import org.apache.coyote.BadRequestException;
 import org.apache.coyote.ContainerThreadMarker;
 import org.apache.coyote.Request;
 import org.apache.juli.logging.Log;
@@ -334,7 +336,18 @@ public class InputBuffer extends Reader
 
         try {
             return coyoteRequest.doRead(this);
+        } catch (BadRequestException bre) {
+            // In synchronous processing, this exception may be swallowed by the application so set error flags here.
+            coyoteRequest.setAttribute(RequestDispatcher.ERROR_EXCEPTION, bre);
+            coyoteRequest.getResponse().setStatus(400);
+            coyoteRequest.getResponse().setError();
+            // Make the exception visible to the application
+            throw bre;
         } catch (IOException ioe) {
+            // In synchronous processing, this exception may be swallowed by the application so set error flags here.
+            coyoteRequest.setAttribute(RequestDispatcher.ERROR_EXCEPTION, ioe);
+            coyoteRequest.getResponse().setStatus(400);
+            coyoteRequest.getResponse().setError();
             // An IOException on a read is almost always due to
             // the remote client aborting the request.
             throw new ClientAbortException(ioe);
