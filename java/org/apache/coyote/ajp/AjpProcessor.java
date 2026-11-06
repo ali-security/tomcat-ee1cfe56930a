@@ -25,6 +25,11 @@ import java.nio.ByteBuffer;
 import java.security.NoSuchProviderException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.servlet.http.HttpServletResponse;
 
@@ -79,6 +84,10 @@ public class AjpProcessor extends AbstractProcessor {
     private static final byte[] pongMessageArray;
 
 
+    private static final Set<String> javaxAttributes;
+    private static final Set<String> iisTlsAttributes;
+
+
     static {
         // Allocate the end message array
         AjpMessage endMessage = new AjpMessage(16);
@@ -119,6 +128,26 @@ public class AjpProcessor extends AbstractProcessor {
         pongMessageArray = new byte[pongMessage.getLen()];
         System.arraycopy(pongMessage.getBuffer(), 0, pongMessageArray,
                 0, pongMessage.getLen());
+
+        // Build the Set of javax attributes
+        Set<String> s = new HashSet<>();
+        s.add("javax.servlet.request.cipher_suite");
+        s.add("javax.servlet.request.key_size");
+        s.add("javax.servlet.request.ssl_session");
+        s.add("javax.servlet.request.X509Certificate");
+        javaxAttributes= Collections.unmodifiableSet(s);
+
+        Set<String> iis = new HashSet<>();
+        iis.add("CERT_ISSUER");
+        iis.add("CERT_SUBJECT");
+        iis.add("CERT_COOKIE");
+        iis.add("HTTPS_SERVER_SUBJECT");
+        iis.add("CERT_FLAGS");
+        iis.add("HTTPS_SECRETKEYSIZE");
+        iis.add("CERT_SERIALNUMBER");
+        iis.add("HTTPS_SERVER_ISSUER");
+        iis.add("HTTPS_KEYSIZE");
+        iisTlsAttributes = Collections.unmodifiableSet(iis);
     }
 
 
@@ -699,8 +728,8 @@ public class AjpProcessor extends AbstractProcessor {
         }
 
         // Decode extra attributes
-        String requiredSecret = protocol.getRequiredSecret();
-        boolean secret = false;
+        String secret = protocol.getSecret();
+        boolean secretPresentInRequest = false;
         byte attributeCode;
         while ((attributeCode = requestHeaderMessage.getByte())
                 != Constants.SC_A_ARE_DONE) {
@@ -729,8 +758,29 @@ public class AjpProcessor extends AbstractProcessor {
                     }
                 } else if(n.equals(Constants.SC_A_SSL_PROTOCOL)) {
                     request.setAttribute(SSLSupport.PROTOCOL_VERSION_KEY, v);
+                } else if (n.equals("JK_LB_ACTIVATION")) {
+                    request.setAttribute(n, v);
+                } else if (javaxAttributes.contains(n)) {
+                    request.setAttribute(n, v);
+                } else if (iisTlsAttributes.contains(n)) {
+                    // Allow IIS TLS attributes
+                    request.setAttribute(n, v);
                 } else {
-                    request.setAttribute(n, v );
+                    // All 'known' attributes will be processed by the previous
+                    // blocks. Any remaining attribute is an 'arbitrary' one.
+                    Pattern pattern = protocol.getAllowedRequestAttributesPatternInternal();
+                    if (pattern == null) {
+                        response.setStatus(403);
+                        setErrorState(ErrorState.CLOSE_CLEAN, null);
+                    } else {
+                        Matcher m = pattern.matcher(n);
+                        if (m.matches()) {
+                            request.setAttribute(n, v);
+                        } else {
+                            response.setStatus(403);
+                            setErrorState(ErrorState.CLOSE_CLEAN, null);
+                        }
+                    }
                 }
                 break;
 
@@ -802,9 +852,9 @@ public class AjpProcessor extends AbstractProcessor {
 
             case Constants.SC_A_SECRET:
                 requestHeaderMessage.getBytes(tmpMB);
-                if (requiredSecret != null) {
-                    secret = true;
-                    if (!ConstantTime.equals(tmpMB.getByteChunk(), requiredSecret)) {
+                if (secret != null && secret.length() > 0) {
+                    secretPresentInRequest = true;
+                    if (!ConstantTime.equals(tmpMB.getByteChunk(), secret)) {
                         response.setStatus(403);
                         setErrorState(ErrorState.CLOSE_CLEAN, null);
                     }
@@ -820,7 +870,7 @@ public class AjpProcessor extends AbstractProcessor {
         }
 
         // Check if secret was submitted if required
-        if ((requiredSecret != null) && !secret) {
+        if (secret != null && secret.length() > 0 && !secretPresentInRequest) {
             response.setStatus(403);
             setErrorState(ErrorState.CLOSE_CLEAN, null);
         }

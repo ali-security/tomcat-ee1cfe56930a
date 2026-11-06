@@ -16,9 +16,13 @@
  */
 package org.apache.coyote.ajp;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -36,10 +40,24 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.catalina.Context;
+import org.apache.catalina.LifecycleState;
+import org.apache.catalina.connector.Connector;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
+import org.apache.tomcat.util.scan.StandardJarScanFilter;
+import org.apache.tomcat.util.scan.StandardJarScanner;
 
 public class TestAbstractAjpProcessor extends TomcatBaseTest {
+
+    @Override
+    public void setUp() throws Exception {
+        super.setUp();
+
+        Connector c = getTomcatInstance().getConnector();
+        c.setProperty("secretRequired", "false");
+        c.setProperty("allowedRequestAttributesPattern", "MYATTRIBUTE.*");
+    }
+
 
     @Override
     protected String getProtocol() {
@@ -490,7 +508,7 @@ public class TestAbstractAjpProcessor extends TomcatBaseTest {
     @Test
     public void testSecret() throws Exception {
         Tomcat tomcat = getTomcatInstance();
-        tomcat.getConnector().setProperty("requiredSecret", "RIGHTSECRET");
+        tomcat.getConnector().setProperty("secret", "RIGHTSECRET");
         tomcat.start();
 
         // No file system docBase required
@@ -617,6 +635,260 @@ public class TestAbstractAjpProcessor extends TomcatBaseTest {
             ajpClient.disconnect();
         }
     }
+
+
+    /*
+     * A zero length secret is treated as if no secret had been configured.
+     */
+    @Test
+    public void testZeroLengthSecret() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Assert.assertTrue(tomcat.getConnector().setProperty("secret", ""));
+        tomcat.start();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        Tomcat.addServlet(ctx, "helloWorld", new HelloWorldServlet());
+        ctx.addServletMappingDecoded("/", "helloWorld");
+
+        SimpleAjpClient ajpClient = new SimpleAjpClient();
+        ajpClient.setPort(getPort());
+        ajpClient.connect();
+        validateCpong(ajpClient.cping());
+
+        TesterAjpMessage forwardMessage = ajpClient.createForwardMessage();
+        forwardMessage.end();
+
+        TesterAjpMessage responseHeaders = ajpClient.sendMessage(forwardMessage);
+        // Expect 3 packets: headers, body, end
+        validateResponseHeaders(responseHeaders, 200, "200");
+        validateResponseBody(ajpClient.readMessage(), HelloWorldServlet.RESPONSE_TEXT);
+        validateResponseEnd(ajpClient.readMessage(), true);
+
+        ajpClient.disconnect();
+    }
+
+
+    /*
+     * CVE-2020-1938. The defaults for an AJP connector must be secure: listen
+     * on the loopback address only, require a secret and reject arbitrary
+     * request attributes.
+     */
+    @Test
+    public void testSecureDefaults() {
+        AjpNioProtocol protocol = new AjpNioProtocol();
+        Assert.assertEquals(InetAddress.getLoopbackAddress(), protocol.getAddress());
+        Assert.assertTrue(protocol.getSecretRequired());
+        Assert.assertNull(protocol.getSecret());
+        Assert.assertNull(protocol.getAllowedRequestAttributesPatternInternal());
+    }
+
+
+    @Test(expected=IllegalArgumentException.class)
+    public void testStartWithoutSecret() throws Exception {
+        AjpNioProtocol protocol = new AjpNioProtocol();
+        protocol.start();
+    }
+
+
+    @Test(expected=IllegalArgumentException.class)
+    public void testStartWithZeroLengthSecret() throws Exception {
+        AjpNioProtocol protocol = new AjpNioProtocol();
+        protocol.setSecret("");
+        protocol.start();
+    }
+
+
+    @SuppressWarnings("deprecation")
+    @Test
+    public void testRequiredSecretAlias() {
+        AjpNioProtocol protocol = new AjpNioProtocol();
+        protocol.setRequiredSecret("RIGHTSECRET");
+        Assert.assertEquals("RIGHTSECRET", protocol.getSecret());
+        Assert.assertEquals("RIGHTSECRET", protocol.getRequiredSecret());
+    }
+
+
+    /*
+     * CVE-2020-1938. A connector that has not been configured with a secret
+     * must not start (and therefore must not accept any requests) unless the
+     * secret has been explicitly configured as not required.
+     */
+    @Test
+    public void testConnectorWithoutSecretDoesNotStart() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Connector c = tomcat.getConnector();
+        Assert.assertTrue(c.setProperty("secretRequired", "true"));
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+        Tomcat.addServlet(ctx, "helloWorld", new HelloWorldServlet());
+        ctx.addServletMappingDecoded("/", "helloWorld");
+
+        tomcat.start();
+
+        Assert.assertEquals(LifecycleState.FAILED, c.getState());
+    }
+
+
+    /*
+     * The request attributes that AJP proxies (mod_jk, mod_proxy_ajp, the ISAPI
+     * redirector) are known to send must still be accepted.
+     */
+    @Test
+    public void testKnownAttributesAccepted() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+        Tomcat.addServlet(ctx, "helloWorld", new HelloWorldServlet());
+        ctx.addServletMappingDecoded("/", "helloWorld");
+
+        tomcat.start();
+
+        SimpleAjpClient ajpClient = new SimpleAjpClient();
+        ajpClient.setPort(getPort());
+        ajpClient.connect();
+        validateCpong(ajpClient.cping());
+
+        TesterAjpMessage forwardMessage = ajpClient.createForwardMessage();
+        forwardMessage.addAttribute("JK_LB_ACTIVATION", "ACT");
+        forwardMessage.addAttribute("javax.servlet.request.ssl_session", "SESSIONID");
+        forwardMessage.addAttribute("CERT_ISSUER", "ISSUER");
+        forwardMessage.addAttribute("HTTPS_KEYSIZE", "256");
+        forwardMessage.end();
+
+        TesterAjpMessage responseHeaders = ajpClient.sendMessage(forwardMessage);
+        // Expect 3 packets: headers, body, end
+        validateResponseHeaders(responseHeaders, 200, "200");
+        validateResponseBody(ajpClient.readMessage(), HelloWorldServlet.RESPONSE_TEXT);
+        validateResponseEnd(ajpClient.readMessage(), true);
+
+        ajpClient.disconnect();
+    }
+
+
+    /*
+     * CVE-2020-1938 (Ghostcat). An AJP client was able to set arbitrary request
+     * attributes. Setting the javax.servlet.include.* attributes allowed the
+     * client to make the DefaultServlet return any file in the web application,
+     * including those under WEB-INF.
+     */
+    @Test
+    public void testArbitraryIncludeAttributesFileRead() throws Exception {
+        doTestArbitraryIncludeAttributes(false, false);
+    }
+
+
+    /*
+     * Positive control for the test above. Explicitly allowing the include
+     * attributes recreates the behaviour before the fix when every attribute
+     * was accepted. This confirms that the attack works in this code base so
+     * that the test above really does test that the attack is blocked.
+     */
+    @Test
+    public void testArbitraryIncludeAttributesFileReadExplicitlyAllowed() throws Exception {
+        doTestArbitraryIncludeAttributes(false, true);
+    }
+
+
+    /*
+     * CVE-2020-1938 (Ghostcat). An AJP client was able to set arbitrary request
+     * attributes. Setting the javax.servlet.include.* attributes allowed the
+     * client to make the JspServlet process any file in the web application,
+     * such as an uploaded file, as a JSP.
+     */
+    @Test
+    public void testArbitraryIncludeAttributesJspInclusion() throws Exception {
+        doTestArbitraryIncludeAttributes(true, false);
+    }
+
+
+    /*
+     * Positive control for the test above.
+     */
+    @Test
+    public void testArbitraryIncludeAttributesJspInclusionExplicitlyAllowed() throws Exception {
+        doTestArbitraryIncludeAttributes(true, true);
+    }
+
+
+    private void doTestArbitraryIncludeAttributes(boolean jsp, boolean allowIncludeAttributes)
+            throws Exception {
+
+        final String fileContent = "GHOSTCAT-WEB-INF-CONTENT";
+        final String jspSource = "<%= \"GHOSTCAT-\" + \"JSP-OUTPUT\" %>";
+        final String jspOutput = "GHOSTCAT-JSP-OUTPUT";
+
+        File appDir = new File(getTemporaryDirectory(), "ghostcat");
+        File webInfDir = new File(appDir, "WEB-INF");
+        Assert.assertTrue(webInfDir.isDirectory() || webInfDir.mkdirs());
+        addDeleteOnTearDown(appDir);
+        // A file that must never be returned to a client
+        Files.write(new File(webInfDir, "secret.txt").toPath(),
+                fileContent.getBytes(StandardCharsets.ISO_8859_1));
+        // A file uploaded by a user that must never be processed as a JSP
+        Files.write(new File(appDir, "upload.txt").toPath(),
+                jspSource.getBytes(StandardCharsets.ISO_8859_1));
+
+        Tomcat tomcat = getTomcatInstance();
+        if (allowIncludeAttributes) {
+            Assert.assertTrue(tomcat.getConnector().setProperty(
+                    "allowedRequestAttributesPattern", "javax\\.servlet\\.include\\..*"));
+        }
+
+        Context ctx = tomcat.addWebapp(null, "/ghostcat", appDir.getAbsolutePath());
+        StandardJarScanner scanner = (StandardJarScanner) ctx.getJarScanner();
+        StandardJarScanFilter filter = (StandardJarScanFilter) scanner.getJarScanFilter();
+        filter.setTldSkip(filter.getTldSkip() + ",testclasses");
+        filter.setPluggabilitySkip(filter.getPluggabilitySkip() + ",testclasses");
+
+        tomcat.start();
+
+        SimpleAjpClient ajpClient = new SimpleAjpClient();
+        ajpClient.setPort(getPort());
+        ajpClient.connect();
+        validateCpong(ajpClient.cping());
+
+        String expected;
+        if (jsp) {
+            // Mapped to the JspServlet
+            ajpClient.setUri("/ghostcat/index.jsp");
+            expected = jspOutput;
+        } else {
+            // Mapped to the DefaultServlet
+            ajpClient.setUri("/ghostcat/index.txt");
+            expected = fileContent;
+        }
+        TesterAjpMessage forwardMessage = ajpClient.createForwardMessage();
+        forwardMessage.addAttribute("javax.servlet.include.request_uri", "/");
+        if (jsp) {
+            forwardMessage.addAttribute("javax.servlet.include.servlet_path", "/upload.txt");
+        } else {
+            forwardMessage.addAttribute("javax.servlet.include.servlet_path", "/");
+            forwardMessage.addAttribute("javax.servlet.include.path_info", "WEB-INF/secret.txt");
+        }
+        forwardMessage.end();
+
+        TesterAjpMessage responseHeaders = ajpClient.sendMessage(forwardMessage);
+        // Expect 3 packets: headers, body, end
+        if (allowIncludeAttributes) {
+            validateResponseHeaders(responseHeaders, 200, "200");
+            String body = extractResponseBody(ajpClient.readMessage());
+            Assert.assertTrue(body, body.contains(expected));
+            validateResponseEnd(ajpClient.readMessage(), true);
+        } else {
+            validateResponseHeaders(responseHeaders, 403, "403");
+            String body = extractResponseBody(ajpClient.readMessage());
+            Assert.assertTrue(body, body.contains("<p><b>Type</b> Status Report</p>"));
+            Assert.assertFalse(body, body.contains(expected));
+            validateResponseEnd(ajpClient.readMessage(), false);
+        }
+
+        ajpClient.disconnect();
+    }
+
 
     @Test
     public void testKeepAlive() throws Exception {
