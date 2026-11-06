@@ -640,4 +640,79 @@ public class TestHttp11InputBuffer extends TomcatBaseTest {
             return true;
         }
     }
+
+
+    @Test
+    public void testInvalidHttp09Method() {
+
+        String[] request = new String[1];
+        request[0] = "POST /test" + SimpleHttpClient.CRLF;
+
+        InvalidClient client = new InvalidClient(request);
+
+        client.doRequest();
+        // The response in that case is HTTP/0.9 so only the body
+        Assert.assertTrue(client.getResponseLine(), client.getResponseLine().contains("400"));
+        Assert.assertTrue(client.isResponseBodyOK());
+    }
+
+
+    @Test
+    public void testInvalidHttp09MethodHead() {
+
+        String[] request = new String[1];
+        request[0] = "HEAD /test" + SimpleHttpClient.CRLF;
+
+        InvalidClient client = new InvalidClient(request);
+
+        client.doRequest();
+        // The response in that case is HTTP/0.9 so only the body
+        Assert.assertTrue(client.getResponseLine(), client.getResponseLine().contains("400"));
+        Assert.assertTrue(client.isResponseBodyOK());
+    }
+
+
+    /**
+     * Invalid request test client.
+     */
+    private class InvalidClient extends SimpleHttpClient {
+
+        private final String[] request;
+
+        public InvalidClient(String[] request) {
+            this.request = request;
+        }
+
+        private Exception doRequest() {
+
+            Tomcat tomcat = getTomcatInstance();
+
+            tomcat.addContext("", TEMP_DIR);
+
+            try {
+                tomcat.start();
+                setPort(tomcat.getConnector().getLocalPort());
+
+                // Open connection
+                connect();
+
+                setRequest(request);
+                processRequest(); // blocks until response has been read
+
+                // Close the connection
+                disconnect();
+            } catch (Exception e) {
+                return e;
+            }
+            return null;
+        }
+
+        @Override
+        public boolean isResponseBodyOK() {
+            if (getResponseBody() == null) {
+                return false;
+            }
+            return true;
+        }
+    }
 }
