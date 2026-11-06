@@ -929,16 +929,6 @@ public class StandardWrapper extends ContainerBase
             referencesLock.readLock().unlock();
         }
 
-        // If not specified on the Wrapper, check the Context
-        if (getParent() instanceof Context) {
-            Context context = (Context) getParent();
-            if (reference != null) {
-                reference = context.findRoleMapping(reference);
-            } else {
-                reference = context.findRoleMapping(name);
-            }
-        }
-
         return reference;
     }
 
