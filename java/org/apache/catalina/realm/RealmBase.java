@@ -758,7 +758,7 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
                 boolean matched = false;
                 for(int k=0; k < patterns.length && !matched; k++) {
                     String pattern = patterns[k];
-                    if(pattern.equals("/")){
+                    if(pattern.equals("/") && collection[j].findMethod(method)){
                         matched = true;
                     }
                 }
