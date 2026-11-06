@@ -50,6 +50,7 @@ import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
 import org.apache.tomcat.unittest.TesterContext;
 import org.apache.tomcat.unittest.TesterResponse;
+import org.apache.tomcat.util.buf.ByteChunk;
 import org.apache.tomcat.util.descriptor.web.FilterDef;
 import org.apache.tomcat.util.descriptor.web.FilterMap;
 
@@ -82,15 +83,21 @@ public class TestRemoteIpFilter extends TomcatBaseTest {
 
         private static final long serialVersionUID = 1L;
 
-        private transient HttpServletRequest request;
-
-        public HttpServletRequest getRequest() {
-            return request;
-        }
+        public String remoteAddr;
+        public String remoteHost;
+        public String scheme;
+        public String serverName;
+        public int serverPort;
+        public boolean isSecure;
 
         @Override
         public void service(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
-            this.request = request;
+            this.isSecure = request.isSecure();
+            this.remoteAddr = request.getRemoteAddr();
+            this.remoteHost = request.getRemoteHost();
+            this.scheme = request.getScheme();
+            this.serverName = request.getServerName();
+            this.serverPort = request.getServerPort();
             PrintWriter writer = response.getWriter();
 
             writer.println("request.remoteAddr=" + request.getRemoteAddr());
@@ -127,16 +134,6 @@ public class TestRemoteIpFilter extends TomcatBaseTest {
 
         public void setScheme(String scheme) {
             getCoyoteRequest().scheme().setString(scheme);
-        }
-
-        @Override
-        public void setAttribute(String name, Object value) {
-            getCoyoteRequest().getAttributes().put(name, value);
-        }
-
-        @Override
-        public Object getAttribute(String name) {
-            return getCoyoteRequest().getAttributes().get(name);
         }
 
         @Override
@@ -770,16 +767,196 @@ public class TestRemoteIpFilter extends TomcatBaseTest {
 
         // VALIDATE
         Assert.assertEquals(HttpURLConnection.HTTP_OK, httpURLConnection.getResponseCode());
-        HttpServletRequest request = mockServlet.getRequest();
-        Assert.assertNotNull(request);
 
         // VALIDATE X-FORWARDED-FOR
-        Assert.assertEquals(expectedRemoteAddr, request.getRemoteAddr());
-        Assert.assertEquals(expectedRemoteAddr, request.getRemoteHost());
+        Assert.assertEquals(expectedRemoteAddr, mockServlet.remoteAddr);
+        Assert.assertEquals(expectedRemoteAddr, mockServlet.remoteHost);
 
         // VALIDATE X-FORWARDED-PROTO
-        Assert.assertTrue(request.isSecure());
-        Assert.assertEquals("https", request.getScheme());
-        Assert.assertEquals(443, request.getServerPort());
+        Assert.assertTrue(mockServlet.isSecure);
+        Assert.assertEquals("https", mockServlet.scheme);
+        Assert.assertEquals(443, mockServlet.serverPort);
+    }
+
+    @Test
+    public void testJSessionIdSecureAttributeMissing() throws Exception {
+
+        // mostly default configuration : enable "x-forwarded-proto"
+        Map<String, String> remoteIpFilterParameter = new HashMap<>();
+        remoteIpFilterParameter.put("protocolHeader", "x-forwarded-proto");
+
+        // SETUP
+        Tomcat tomcat = getTomcatInstance();
+        Context root = tomcat.addContext("", TEMP_DIR);
+
+        FilterDef filterDef = new FilterDef();
+        filterDef.getParameterMap().putAll(remoteIpFilterParameter);
+        filterDef.setFilterClass(RemoteIpFilter.class.getName());
+        filterDef.setFilterName(RemoteIpFilter.class.getName());
+
+        root.addFilterDef(filterDef);
+
+        FilterMap filterMap = new FilterMap();
+        filterMap.setFilterName(RemoteIpFilter.class.getName());
+        filterMap.addURLPatternDecoded("*");
+        root.addFilterMap(filterMap);
+
+        Bug66471Servlet bug66471Servlet = new Bug66471Servlet();
+
+        Tomcat.addServlet(root, bug66471Servlet.getClass().getName(), bug66471Servlet);
+        root.addServletMappingDecoded("/test", bug66471Servlet.getClass().getName());
+
+        getTomcatInstance().start();
+
+        Map<String, List<String>> resHeaders = new HashMap<>();
+        Map<String, List<String>> reqHeaders = new HashMap<>();
+        String expectedRemoteAddr = "my-remote-addr";
+        List<String> forwardedFor = new ArrayList<>(1);
+        forwardedFor.add(expectedRemoteAddr);
+        List<String> forwardedProto = new ArrayList<>(1);
+        forwardedProto.add("https");
+        reqHeaders.put("x-forwarded-for", forwardedFor);
+        reqHeaders.put("x-forwarded-proto", forwardedProto);
+
+        getUrl("http://localhost:" + tomcat.getConnector().getLocalPort() +
+            "/test", null, reqHeaders, resHeaders);
+        String setCookie = resHeaders.get("Set-Cookie").get(0);
+        Assert.assertTrue(setCookie.contains("Secure"));
+        Assert.assertTrue(bug66471Servlet.isSecure.booleanValue());
+    }
+    public static class Bug66471Servlet extends HttpServlet {
+        private static final long serialVersionUID = 1L;
+        public Boolean isSecure;
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+            req.getSession();
+            isSecure = (Boolean) req.getAttribute(Globals.REMOTE_IP_FILTER_SECURE);
+        }
+    }
+
+
+    /*
+     * Not in the upstream commit. X-Forwarded-Proto that is not https must not
+     * produce a Secure session cookie and must leave the attribute false.
+     */
+    @Test
+    public void testJSessionIdNotSecureWhenForwardedProtoHttp() throws Exception {
+        doTestJSessionIdSecure("http", false);
+    }
+
+
+    /*
+     * Not in the upstream commit. Without the protocol header the filter must
+     * not touch the secure flag.
+     */
+    @Test
+    public void testJSessionIdNotSecureWithoutForwardedProto() throws Exception {
+        doTestJSessionIdSecure(null, false);
+    }
+
+
+    /*
+     * Not in the upstream commit. A comma separated list is only secure if
+     * every element is https.
+     */
+    @Test
+    public void testJSessionIdNotSecureForwardedProtoMixed() throws Exception {
+        doTestJSessionIdSecure("https,http", false);
+    }
+
+
+    /*
+     * Not in the upstream commit. The default configuration (only the filter
+     * name and class) uses the default protocolHeader of X-Forwarded-Proto.
+     */
+    @Test
+    public void testJSessionIdSecureDefaultConfiguration() throws Exception {
+        doTestJSessionIdSecure("https", true, false);
+    }
+
+
+    private void doTestJSessionIdSecure(String forwardedProto, boolean expectSecure) throws Exception {
+        doTestJSessionIdSecure(forwardedProto, expectSecure, true);
+    }
+
+
+    private void doTestJSessionIdSecure(String forwardedProto, boolean expectSecure,
+            boolean setProtocolHeader) throws Exception {
+
+        Tomcat tomcat = getTomcatInstance();
+        Context root = tomcat.addContext("", TEMP_DIR);
+
+        FilterDef filterDef = new FilterDef();
+        if (setProtocolHeader) {
+            filterDef.getParameterMap().put("protocolHeader", "x-forwarded-proto");
+        }
+        filterDef.setFilterClass(RemoteIpFilter.class.getName());
+        filterDef.setFilterName(RemoteIpFilter.class.getName());
+        root.addFilterDef(filterDef);
+
+        FilterMap filterMap = new FilterMap();
+        filterMap.setFilterName(RemoteIpFilter.class.getName());
+        filterMap.addURLPatternDecoded("*");
+        root.addFilterMap(filterMap);
+
+        Bug66471Servlet servlet = new Bug66471Servlet();
+        Tomcat.addServlet(root, servlet.getClass().getName(), servlet);
+        root.addServletMappingDecoded("/test", servlet.getClass().getName());
+
+        tomcat.start();
+
+        Map<String, List<String>> resHeaders = new HashMap<>();
+        Map<String, List<String>> reqHeaders = new HashMap<>();
+        reqHeaders.put("x-forwarded-for", Collections.singletonList("my-remote-addr"));
+        if (forwardedProto != null) {
+            reqHeaders.put("x-forwarded-proto", Collections.singletonList(forwardedProto));
+        }
+
+        getUrl("http://localhost:" + tomcat.getConnector().getLocalPort() + "/test", new ByteChunk(), reqHeaders,
+                resHeaders);
+
+        String setCookie = resHeaders.get("Set-Cookie").get(0);
+        Assert.assertTrue(setCookie, setCookie.startsWith("JSESSIONID="));
+        Assert.assertEquals(setCookie, expectSecure, setCookie.contains("Secure"));
+        Assert.assertEquals(Boolean.valueOf(expectSecure), servlet.isSecure);
+    }
+
+
+    /*
+     * Not in the upstream commit. The new attribute is available on every
+     * request (not only those processed by the filter) and only accepts a
+     * Boolean when set. Other types are ignored rather than being coerced.
+     */
+    @Test
+    public void testRemoteIpFilterSecureAttributeSetter() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Context root = tomcat.addContext("", TEMP_DIR);
+
+        final boolean[] results = new boolean[4];
+        HttpServlet servlet = new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                    throws ServletException, IOException {
+                results[0] = Boolean.FALSE.equals(req.getAttribute(Globals.REMOTE_IP_FILTER_SECURE));
+                req.setAttribute(Globals.REMOTE_IP_FILTER_SECURE, "true");
+                results[1] = !req.isSecure();
+                req.setAttribute(Globals.REMOTE_IP_FILTER_SECURE, Boolean.TRUE);
+                results[2] = req.isSecure() && Boolean.TRUE.equals(req.getAttribute(Globals.REMOTE_IP_FILTER_SECURE));
+                req.setAttribute(Globals.REMOTE_IP_FILTER_SECURE, Boolean.FALSE);
+                results[3] = !req.isSecure();
+            }
+        };
+        Tomcat.addServlet(root, "attr", servlet);
+        root.addServletMappingDecoded("/test", "attr");
+
+        tomcat.start();
+
+        Assert.assertEquals(200, getUrl("http://localhost:" + tomcat.getConnector().getLocalPort() + "/test",
+                new ByteChunk(), null));
+        for (int i = 0; i < results.length; i++) {
+            Assert.assertTrue("check " + i, results[i]);
+        }
     }
 }
