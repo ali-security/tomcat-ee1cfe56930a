@@ -530,7 +530,7 @@ public class Request implements HttpServletRequest {
     }
 
 
-    protected void recycleSessionInfo() {
+    public void recycleSessionInfo() {
         if (session != null) {
             try {
                 session.endAccess();

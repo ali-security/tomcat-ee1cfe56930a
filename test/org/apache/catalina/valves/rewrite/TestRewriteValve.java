@@ -16,11 +16,23 @@
  */
 package org.apache.catalina.valves.rewrite;
 
+import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.nio.charset.StandardCharsets;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+
+import javax.servlet.ServletContainerInitializer;
+import javax.servlet.ServletContext;
+import javax.servlet.ServletException;
+import javax.servlet.SessionTrackingMode;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.servlet.http.HttpSession;
 
 import org.junit.Assert;
 import org.junit.Test;
@@ -663,6 +675,182 @@ public class TestRewriteValve extends TomcatBaseTest {
             }
         }
     }
+
+    /*
+     * CVE-2025-55668 - Session fixation in the rewrite valve.
+     *
+     * When the rewrite valve issues a redirect ([R] flag), the redirect Location
+     * must be passed through Response.encodeRedirectURL() so that, when the
+     * container is tracking the session via the URL (cookies not usable by the
+     * client), the session id is encoded into the Location as a ;jsessionid=
+     * path parameter rather than allowing an attacker-supplied session id to be
+     * silently reused across the redirect.
+     *
+     * This test drives a first request that creates a session (returning the id
+     * in the URL because the client does not accept cookies), then a second
+     * request to a rewrite [R] redirect rule carrying that session id as a URL
+     * path parameter. The redirect Location must contain the ;jsessionid= path
+     * parameter, proving the redirect went through encodeRedirectURL().
+     */
+    @Test
+    public void testRedirectEncodesSessionId() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("redirect", null);
+        // The default context supports both COOKIE and URL session tracking.
+        // Because the test client below does not return a session cookie, the
+        // session id must be tracked via the URL and therefore encoded into
+        // both generated URLs and redirect Location headers.
+
+        RewriteValve rewriteValve = new RewriteValve();
+        ctx.getPipeline().addValve(rewriteValve);
+
+        rewriteValve.setConfiguration("RewriteRule ^/from/a$ /to/b [R]");
+
+        Tomcat.addServlet(ctx, "session", new SessionCreatingServlet());
+        ctx.addServletMappingDecoded("/to/b", "session");
+
+        // Disable following of redirects so we can inspect the Location header
+        boolean originalValue = HttpURLConnection.getFollowRedirects();
+        HttpURLConnection.setFollowRedirects(false);
+        try {
+            tomcat.start();
+
+            // First request: create a session. Because the client does not send
+            // the session id back via a cookie, the response encodes it in the
+            // body via encodeURL().
+            ByteChunk res1 = new ByteChunk();
+            int rc1 = getUrl("http://localhost:" + getPort() + "/redirect/to/b", res1, null);
+            Assert.assertEquals(200, rc1);
+            res1.setCharset(StandardCharsets.UTF_8);
+            String body = res1.toString();
+            int idx = body.indexOf(";jsessionid=");
+            Assert.assertTrue("No session id encoded in first response: " + body, idx != -1);
+            String sessionId = body.substring(idx + ";jsessionid=".length()).trim();
+
+            // Second request: hit the [R] redirect rule carrying the session id
+            // as a URL path parameter. The redirect Location must be encoded
+            // with the session id, proving encodeRedirectURL() was applied.
+            ByteChunk res2 = new ByteChunk();
+            Map<String, List<String>> resHead = new HashMap<>();
+            int rc2 = methodUrl(
+                    "http://localhost:" + getPort() + "/redirect/from/a;jsessionid=" + sessionId,
+                    res2, DEFAULT_CLIENT_TIMEOUT_MS, null, resHead, "GET", false);
+            Assert.assertEquals(302, rc2);
+            List<String> locations = resHead.get("Location");
+            Assert.assertNotNull(locations);
+            Assert.assertFalse(locations.isEmpty());
+            String redirectURI = locations.get(0);
+            Assert.assertTrue("Redirect Location did not encode the session id: " + redirectURI,
+                    redirectURI.contains(";jsessionid=" + sessionId));
+        } finally {
+            HttpURLConnection.setFollowRedirects(originalValue);
+        }
+    }
+
+
+    /*
+     * CVE-2025-55668 - Session fixation in the rewrite valve.
+     *
+     * When the rewrite valve re-processes a rewritten request, the session
+     * information parsed for the original request must not be retained. If it
+     * is, a session id supplied in the URL of the original request is used for
+     * the rewritten request even when the web application that ends up
+     * processing the rewritten request does not permit URL session tracking.
+     * That allows an attacker to craft a URL that causes the victim to interact
+     * with the target web application in the context of the attacker's session.
+     */
+    @Test
+    public void testRewriteDoesNotRetainRequestedSessionId() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // Original target - supports both COOKIE and URL session tracking
+        Context ctxA = tomcat.addContext("/a", null);
+        Tomcat.addServlet(ctxA, "sessionA", new SessionIdServlet(false));
+        ctxA.addServletMappingDecoded("/x", "sessionA");
+
+        // Rewritten target - only supports COOKIE session tracking
+        Context ctxB = tomcat.addContext("/b", null);
+        ctxB.addServletContainerInitializer(new CookieOnlySessionTrackingSCI(), null);
+        Tomcat.addServlet(ctxB, "sessionB", new SessionIdServlet(false));
+        ctxB.addServletMappingDecoded("/x", "sessionB");
+        Tomcat.addServlet(ctxB, "createB", new SessionIdServlet(true));
+        ctxB.addServletMappingDecoded("/create", "createB");
+
+        RewriteValve rewriteValve = new RewriteValve();
+        tomcat.getHost().getPipeline().addValve(rewriteValve);
+
+        rewriteValve.setConfiguration("RewriteRule ^/a/(.*)$ /b/$1");
+
+        tomcat.start();
+
+        // Attacker obtains a session in the rewritten target
+        ByteChunk res1 = new ByteChunk();
+        int rc1 = getUrl("http://localhost:" + getPort() + "/b/create", res1, null);
+        Assert.assertEquals(200, rc1);
+        res1.setCharset(StandardCharsets.UTF_8);
+        String attackerSessionId = res1.toString().trim();
+        Assert.assertNotEquals("null", attackerSessionId);
+
+        // Victim follows a crafted link with the attacker's session id in the
+        // URL. The request is rewritten to a web application that does not
+        // accept session ids from the URL so no session must be found.
+        ByteChunk res2 = new ByteChunk();
+        int rc2 = getUrl("http://localhost:" + getPort() + "/a/x;jsessionid=" + attackerSessionId,
+                res2, null);
+        Assert.assertEquals(200, rc2);
+        res2.setCharset(StandardCharsets.UTF_8);
+        String victimSessionId = res2.toString().trim();
+        Assert.assertNotEquals("Rewritten request used the attacker's session",
+                attackerSessionId, victimSessionId);
+        Assert.assertEquals("null", victimSessionId);
+    }
+
+
+    private static class CookieOnlySessionTrackingSCI implements ServletContainerInitializer {
+
+        @Override
+        public void onStartup(Set<Class<?>> c, ServletContext ctx) throws ServletException {
+            ctx.setSessionTrackingModes(EnumSet.of(SessionTrackingMode.COOKIE));
+        }
+    }
+
+
+    private static class SessionIdServlet extends HttpServlet {
+        private static final long serialVersionUID = 1L;
+
+        private final boolean create;
+
+        SessionIdServlet(boolean create) {
+            this.create = create;
+        }
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            HttpSession session = req.getSession(create);
+            resp.setContentType("text/plain");
+            resp.getWriter().print(session == null ? "null" : session.getId());
+        }
+    }
+
+
+    private static class SessionCreatingServlet extends HttpServlet {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                throws ServletException, IOException {
+            // Ensure a session exists so it can be encoded into subsequent URLs
+            req.getSession(true);
+            resp.setContentType("text/plain");
+            // Encode a URL so the client learns the session id when cookies are
+            // not in use (URL session tracking).
+            resp.getWriter().print(resp.encodeURL("/redirect/to/b"));
+        }
+    }
+
 
     private void doTestRedirect(String config, String request, String expectedURI,
         int expectedStatusCode) throws Exception {
