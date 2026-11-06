@@ -152,6 +152,9 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
         this.adapter = adapter;
         this.connectionId = Integer.toString(connectionIdGenerator.getAndIncrement());
 
+        // Initialise the overhead budget relative to the configured overhead count factor
+        overheadCount.set(-10L * protocol.getOverheadCountFactor());
+
         lastNonFinalDataPayload = protocol.getOverheadDataThreshold() * 2;
         lastWindowUpdate = protocol.getOverheadWindowUpdateThreshold() * 2;
 
@@ -535,6 +538,9 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
             log.debug(sm.getString("upgradeHandler.rst.debug", connectionId,
                     Integer.toString(se.getStreamId()), se.getError(), se.getMessage()));
         }
+
+        // Treat a sent reset like a received reset and increment the overhead count
+        increaseOverheadCount(getProtocol().getOverheadResetFactor());
 
         // Write a RST frame
         byte[] rstFrame = new byte[13];
@@ -1328,17 +1334,34 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
     }
 
 
-    private void reduceOverheadCount() {
-        overheadCount.decrementAndGet();
+    void reduceOverheadCount() {
+        // A non-overhead frame reduces the overhead count by
+        // Http2Protocol.DEFAULT_OVERHEAD_REDUCTION_FACTOR. A simple browser
+        // request is likely to have one non-overhead frame (HEADERS) and one
+        // overhead frame (PRIORITY). With the default settings the overhead
+        // count will reduce by 10 for each simple request.
+        // Requests and responses with bodies will create additional
+        // non-overhead frames, further reducing the overhead count.
+        overheadCount.addAndGet(Http2Protocol.DEFAULT_OVERHEAD_REDUCTION_FACTOR);
     }
 
 
     private void increaseOverheadCount() {
+        // An overhead frame increases the overhead count by
+        // overheadCountFactor. By default, this means an overhead frame
+        // increases the overhead count by 10.
         overheadCount.addAndGet(getProtocol().getOverheadCountFactor());
     }
 
 
-    private void increaseOverheadCount(int increment) {
+    /**
+     * Increase the overhead count by the given amount. Used for reset frames
+     * (received or sent) which increase the overhead count by
+     * overheadResetFactor.
+     *
+     * @param increment The amount by which to increase the overhead count
+     */
+    protected void increaseOverheadCount(int increment) {
         overheadCount.addAndGet(increment);
     }
 
