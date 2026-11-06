@@ -33,11 +33,16 @@ import org.apache.catalina.Context;
 import org.apache.catalina.startup.SimpleHttpClient;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
+import org.apache.tomcat.util.http.parser.HttpParser;
 
 public class TestChunkedInputFilter extends TomcatBaseTest {
 
     private static final String LF = "\n";
     private static final int EXT_SIZE_LIMIT = 10;
+    // Space - a separator, hence not a token character
+    private static final char SMUGGLED_NAME_CHAR = ' ';
+    // Vertical tab - a control character other than CR, LF and HT
+    private static final char SMUGGLED_VALUE_CHAR = (char) 0x0B;
 
     @Test
     public void testChunkHeaderCRLF() throws Exception {
@@ -398,6 +403,130 @@ public class TestChunkedInputFilter extends TomcatBaseTest {
             "4" + SimpleHttpClient.CRLF +
             "&b=1" + SimpleHttpClient.CRLF +
             "0" + SimpleHttpClient.CRLF +
+            SimpleHttpClient.CRLF };
+
+        TrailerClient client =
+                new TrailerClient(tomcat.getConnector().getLocalPort());
+        client.setRequest(request);
+
+        client.connect();
+        client.processRequest();
+
+        Assert.assertTrue(client.getResponseLine(), client.isResponse500());
+    }
+
+
+    /*
+     * Request smuggling vector for CVE-2023-45648. Trailer headers were parsed
+     * far more leniently than standard headers. Any byte that was not a colon
+     * was silently accepted as part of the trailer field name so a name
+     * containing a space (or any other separator) was accepted by Tomcat. A
+     * reverse proxy that applies the standard, stricter rules sees a different
+     * set of trailer fields (or a different end of the trailer section) than
+     * Tomcat does, which allows a request to be smuggled past Tomcat.
+     *
+     * Before the fix the space was simply appended to the trailer field name
+     * and the request was processed normally (200). After the fix the
+     * non-token byte is rejected while parsing the trailer field name so the
+     * request is rejected instead.
+     */
+    @Test
+    public void testTrailerHeaderNameNonToken() throws Exception {
+        // The exploit byte must be one the pre-fix parser accepted, i.e. any
+        // byte other than the colon that terminates the field name. Guard the
+        // test against silently ceasing to discriminate.
+        Assert.assertNotEquals(':', SMUGGLED_NAME_CHAR);
+        Assert.assertFalse(HttpParser.isToken(SMUGGLED_NAME_CHAR));
+
+        // Setup Tomcat instance
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        // expectPass == false so the servlet converts the read failure to a 500
+        Tomcat.addServlet(ctx, "servlet", new EchoHeaderServlet(false));
+        ctx.addServletMappingDecoded("/", "servlet");
+
+        tomcat.start();
+
+        String[] request = new String[] {
+            "POST /echo-params.jsp HTTP/1.1" + SimpleHttpClient.CRLF +
+            "Host: any" + SimpleHttpClient.CRLF +
+            "Transfer-encoding: chunked" + SimpleHttpClient.CRLF +
+            "Content-Type: application/x-www-form-urlencoded" +
+                    SimpleHttpClient.CRLF +
+            "Connection: close" + SimpleHttpClient.CRLF +
+            SimpleHttpClient.CRLF +
+            "3" + SimpleHttpClient.CRLF +
+            "a=0" + SimpleHttpClient.CRLF +
+            "4" + SimpleHttpClient.CRLF +
+            "&b=1" + SimpleHttpClient.CRLF +
+            "0" + SimpleHttpClient.CRLF +
+            // Non-token character (a space) inside the trailer field name
+            "x-trailer" + SMUGGLED_NAME_CHAR + "1: Value1" + SimpleHttpClient.CRLF +
+            SimpleHttpClient.CRLF };
+
+        TrailerClient client =
+                new TrailerClient(tomcat.getConnector().getLocalPort());
+        client.setRequest(request);
+
+        client.connect();
+        client.processRequest();
+
+        Assert.assertTrue(client.getResponseLine(), client.isResponse500());
+    }
+
+
+    /*
+     * Request smuggling vector for CVE-2023-45648. Trailer header values were
+     * parsed far more leniently than standard header values. Control
+     * characters were silently accepted as part of the value whereas standard
+     * header parsing rejects them. A reverse proxy that applies the standard
+     * rules therefore has a different view of the request to Tomcat, which
+     * allows a request to be smuggled past Tomcat.
+     *
+     * Before the fix the control character was simply appended to the trailer
+     * field value and the request was processed normally (200). After the fix
+     * the control character is rejected so the request is rejected instead.
+     */
+    @Test
+    public void testTrailerHeaderValueControlChar() throws Exception {
+        // The exploit byte must be one the pre-fix parser accepted, i.e. not
+        // CR, LF (which end the line) and not the HT that remains valid. Guard
+        // the test against silently ceasing to discriminate.
+        Assert.assertNotEquals('\r', SMUGGLED_VALUE_CHAR);
+        Assert.assertNotEquals('\n', SMUGGLED_VALUE_CHAR);
+        Assert.assertNotEquals('\t', SMUGGLED_VALUE_CHAR);
+        Assert.assertTrue(HttpParser.isControl(SMUGGLED_VALUE_CHAR));
+
+        // Setup Tomcat instance
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        // expectPass == false so the servlet converts the read failure to a 500
+        Tomcat.addServlet(ctx, "servlet", new EchoHeaderServlet(false));
+        ctx.addServletMappingDecoded("/", "servlet");
+
+        tomcat.start();
+
+        String[] request = new String[] {
+            "POST /echo-params.jsp HTTP/1.1" + SimpleHttpClient.CRLF +
+            "Host: any" + SimpleHttpClient.CRLF +
+            "Transfer-encoding: chunked" + SimpleHttpClient.CRLF +
+            "Content-Type: application/x-www-form-urlencoded" +
+                    SimpleHttpClient.CRLF +
+            "Connection: close" + SimpleHttpClient.CRLF +
+            SimpleHttpClient.CRLF +
+            "3" + SimpleHttpClient.CRLF +
+            "a=0" + SimpleHttpClient.CRLF +
+            "4" + SimpleHttpClient.CRLF +
+            "&b=1" + SimpleHttpClient.CRLF +
+            "0" + SimpleHttpClient.CRLF +
+            // Control character (vertical tab) inside the trailer field value
+            "x-trailer1: Value1" + SMUGGLED_VALUE_CHAR + SimpleHttpClient.CRLF +
             SimpleHttpClient.CRLF };
 
         TrailerClient client =

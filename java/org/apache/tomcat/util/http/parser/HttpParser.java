@@ -239,6 +239,17 @@ public class HttpParser {
     }
 
 
+    public static boolean isControl(int c) {
+        // Fast for valid control characters, slower for some incorrect
+        // ones
+        try {
+            return IS_CONTROL[c];
+        } catch (ArrayIndexOutOfBoundsException ex) {
+            return false;
+        }
+    }
+
+
     public static boolean isToken(int c) {
         // Fast for correct values, slower for incorrect ones
         try {
