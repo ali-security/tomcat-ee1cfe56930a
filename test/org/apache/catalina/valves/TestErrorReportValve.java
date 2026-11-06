@@ -17,6 +17,12 @@
 package org.apache.catalina.valves;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.ResourceBundle;
 
 import javax.servlet.AsyncContext;
 import javax.servlet.RequestDispatcher;
@@ -260,6 +266,75 @@ public class TestErrorReportValve extends TomcatBaseTest {
 
         Assert.assertEquals(res.toString(), "OK");
         Assert.assertEquals(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, rc);
+    }
+
+
+    @Test
+    public void testAcceptLanguageResourceBundleCacheUsage() throws Exception {
+        // Each request carries more locales than the default maxLocaleCount
+        doTestAcceptLanguageResourceBundleCacheUsage(20, 20, 0);
+    }
+
+
+    @Test
+    public void testAcceptLanguageResourceBundleCacheUsageWithinLimit() throws Exception {
+        // Each request carries no more locales than the default
+        // maxLocaleCount so every locale reaches the StringManager lookup.
+        // Use different tags to the other test so the result does not depend
+        // on the order in which the tests are executed.
+        doTestAcceptLanguageResourceBundleCacheUsage(50, 10, 1000);
+    }
+
+
+    private void doTestAcceptLanguageResourceBundleCacheUsage(int requests, int localesPerRequest,
+            int tagOffset) throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        tomcat.addContext("", null);
+
+        tomcat.start();
+
+        int initial = resourceBundleCacheSize();
+
+        for (int i = 0; i < requests; i++) {
+            StringBuilder acceptLanguage = new StringBuilder();
+            for (int j = 0; j < localesPerRequest; j++) {
+                if (acceptLanguage.length() > 0) {
+                    acceptLanguage.append(',');
+                }
+                acceptLanguage.append(fakeLanguageTag(tagOffset + i * localesPerRequest + j));
+            }
+            Map<String,List<String>> reqHead = new HashMap<>();
+            reqHead.put("Accept-Language", Collections.singletonList(acceptLanguage.toString()));
+            ByteChunk res = new ByteChunk();
+            int rc = getUrl("http://localhost:" + getPort() + "/does-not-exist-" + i, res, reqHead, null);
+            Assert.assertEquals(HttpServletResponse.SC_NOT_FOUND, rc);
+        }
+
+        int delta = resourceBundleCacheSize() - initial;
+        Assert.assertTrue("ResourceBundle cache grew by " + delta + " entries for " +
+                (requests * localesPerRequest) + " unknown request locales", delta < 50);
+    }
+
+
+    private static String fakeLanguageTag(int i) {
+        StringBuilder tag = new StringBuilder("xxxxx");
+        int v = i;
+        for (int k = 4; k >= 0; k--) {
+            tag.setCharAt(k, (char) ('a' + v % 26));
+            v /= 26;
+        }
+        return tag.toString();
+    }
+
+
+    @SuppressWarnings("unchecked")
+    private static int resourceBundleCacheSize() throws Exception {
+        Field field = ResourceBundle.class.getDeclaredField("cacheList");
+        field.setAccessible(true);
+        Map<Object,Object> cache = (Map<Object,Object>) field.get(null);
+        return cache.size();
     }
 
 

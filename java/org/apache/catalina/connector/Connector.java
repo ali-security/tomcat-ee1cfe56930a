@@ -197,6 +197,13 @@ public class Connector extends LifecycleMBeanBase  {
     private int maxCookieCount = 200;
 
     /**
+     * The maximum number of locales that will be parsed for a request. Locales
+     * above this limit will be ignored. Use a value less than zero for no
+     * limit. Defaults to 10.
+     */
+    private int maxLocaleCount = 10;
+
+    /**
      * The maximum number of parameters (GET plus POST) which will be
      * automatically parsed by the container. 10000 by default. A value of less
      * than 0 means no limit.
@@ -402,6 +409,30 @@ public class Connector extends LifecycleMBeanBase  {
 
     public void setMaxCookieCount(int maxCookieCount) {
         this.maxCookieCount = maxCookieCount;
+    }
+
+
+    /**
+     * Returns the maximum number of locales that will be parsed for a request.
+     * Locales above this limit will be ignored when the locales are parsed. A
+     * value of less than zero means no limit.
+     *
+     * @return the maximum locale count
+     */
+    public int getMaxLocaleCount() {
+        return maxLocaleCount;
+    }
+
+
+    /**
+     * Sets the maximum number of locales that will be parsed for a request.
+     * Locales above this limit will be ignored when the locales are parsed. A
+     * value of less than zero means no limit.
+     *
+     * @param maxLocaleCount the new maximum locale count
+     */
+    public void setMaxLocaleCount(int maxLocaleCount) {
+        this.maxLocaleCount = maxLocaleCount;
     }
 
 

@@ -36,8 +36,15 @@ public class TestSSLValve {
     public static class MockRequest extends Request {
 
         public MockRequest() {
-            super(EasyMock.createMock(Connector.class));
+            super(createReplayedConnector());
             setCoyoteRequest(new org.apache.coyote.Request());
+        }
+
+        private static Connector createReplayedConnector() {
+            // The Request constructor reads settings from the Connector so the mock has to be in replay state
+            Connector connector = EasyMock.createNiceMock(Connector.class);
+            EasyMock.replay(connector);
+            return connector;
         }
 
         @Override
@@ -243,6 +250,8 @@ public class TestSSLValve {
 
     @Test
     public void testClientCertProviderNotFound() throws Exception {
+        // The connector mock is already in replay state so record this expectation from scratch
+        EasyMock.reset(mockRequest.getConnector());
         EasyMock.expect(mockRequest.getConnector().getProperty("clientCertProvider")).andStubReturn("wontBeFound");
         EasyMock.replay(mockRequest.getConnector());
         mockRequest.setHeader(valve.getSslClientCertHeader(), certificateSingleLine(" "));
