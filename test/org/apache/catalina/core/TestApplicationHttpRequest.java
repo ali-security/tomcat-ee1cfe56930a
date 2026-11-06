@@ -31,6 +31,8 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.catalina.Context;
+import org.apache.catalina.connector.Request;
+import org.apache.catalina.session.StandardSession;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
 import org.apache.tomcat.util.ExceptionUtils;
@@ -352,6 +354,44 @@ public class TestApplicationHttpRequest extends TomcatBaseTest {
             } else {
                 pw.print("OK");
             }
+        }
+    }
+
+
+    @Test
+    public void testRecycleWithFailingSessionEndAccess() {
+        Request connectorRequest = new Request(null);
+        connectorRequest.setCoyoteRequest(new org.apache.coyote.Request());
+
+        ApplicationHttpRequest request = new ApplicationHttpRequest(
+                connectorRequest.getRequest(), new StandardContext(), false);
+
+        EndAccessFailSession session = new EndAccessFailSession();
+        request.session = session;
+
+        // A failure to end access to the session must not escape from
+        // recycle() as that would prevent the remainder of the dispatch clean
+        // up from completing
+        request.recycle();
+
+        Assert.assertTrue(session.endAccessCalled);
+    }
+
+
+    private static class EndAccessFailSession extends StandardSession {
+
+        private static final long serialVersionUID = 1L;
+
+        private volatile boolean endAccessCalled = false;
+
+        EndAccessFailSession() {
+            super(null);
+        }
+
+        @Override
+        public void endAccess() {
+            endAccessCalled = true;
+            throw new IllegalStateException("Session end access failure");
         }
     }
 }

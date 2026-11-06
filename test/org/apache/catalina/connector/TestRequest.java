@@ -29,6 +29,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.charset.UnsupportedCharsetException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
@@ -40,6 +42,7 @@ import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import javax.servlet.http.Part;
 
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -973,6 +976,100 @@ public class TestRequest extends TomcatBaseTest {
                 throws ServletException, IOException {
             // Container will handle any errors
             req.getReader();
+        }
+    }
+
+
+    @Test
+    public void testRecycleWithFailingPartDelete() {
+        Request request = new Request(null);
+        request.setCoyoteRequest(new org.apache.coyote.Request());
+
+        // State from the current request that must not leak into the next
+        request.setAttribute("private-data", "secret");
+        request.setNote("private-note", "secret");
+
+        TesterPart failingPart = new TesterPart("failing", true);
+        TesterPart part = new TesterPart("other", false);
+        List<Part> parts = new ArrayList<>();
+        parts.add(failingPart);
+        parts.add(part);
+        request.parts = parts;
+
+        // A failure to delete a part must neither escape from recycle() nor
+        // prevent the remainder of the request from being recycled
+        request.recycle();
+
+        Assert.assertTrue(failingPart.deleteCalled);
+        Assert.assertTrue(part.deleteCalled);
+        Assert.assertNull(request.parts);
+        Assert.assertNull(request.getAttribute("private-data"));
+        Assert.assertNull(request.getNote("private-note"));
+    }
+
+
+    private static class TesterPart implements Part {
+
+        private final String name;
+        private final boolean failOnDelete;
+        private volatile boolean deleteCalled = false;
+
+        TesterPart(String name, boolean failOnDelete) {
+            this.name = name;
+            this.failOnDelete = failOnDelete;
+        }
+
+        @Override
+        public InputStream getInputStream() throws IOException {
+            return null;
+        }
+
+        @Override
+        public String getContentType() {
+            return null;
+        }
+
+        @Override
+        public String getName() {
+            return name;
+        }
+
+        @Override
+        public String getSubmittedFileName() {
+            return null;
+        }
+
+        @Override
+        public long getSize() {
+            return 0;
+        }
+
+        @Override
+        public void write(String fileName) throws IOException {
+            // NO-OP
+        }
+
+        @Override
+        public void delete() throws IOException {
+            deleteCalled = true;
+            if (failOnDelete) {
+                throw new IllegalStateException("Part delete failure");
+            }
+        }
+
+        @Override
+        public String getHeader(String name) {
+            return null;
+        }
+
+        @Override
+        public Collection<String> getHeaders(String name) {
+            return Collections.emptyList();
+        }
+
+        @Override
+        public Collection<String> getHeaderNames() {
+            return Collections.emptyList();
         }
     }
 }

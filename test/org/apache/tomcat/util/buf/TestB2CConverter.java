@@ -16,6 +16,8 @@
  */
 package org.apache.tomcat.util.buf;
 
+import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.nio.charset.MalformedInputException;
 import java.nio.charset.StandardCharsets;
@@ -139,5 +141,25 @@ public class TestB2CConverter {
             e = mie;
         }
         Assert.assertNotNull(e);
+    }
+
+
+    @Test
+    public void testRecycleWithFailingDecoderReset() throws Exception {
+        B2CConverter conv = new B2CConverter(new TesterResetFailCharset());
+
+        // Simulate an incomplete character left over from the previous use of
+        // this converter
+        Field f = B2CConverter.class.getDeclaredField("leftovers");
+        f.setAccessible(true);
+        ByteBuffer leftovers = (ByteBuffer) f.get(conv);
+        leftovers.put((byte) 'A');
+        Assert.assertEquals(1, leftovers.position());
+
+        // A failure to reset the decoder must neither escape from recycle()
+        // nor prevent the remainder of the converter from being recycled
+        conv.recycle();
+
+        Assert.assertEquals(0, leftovers.position());
     }
 }
