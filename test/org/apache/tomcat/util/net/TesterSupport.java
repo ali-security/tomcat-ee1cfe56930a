@@ -29,6 +29,7 @@ import java.security.Principal;
 import java.security.PrivateKey;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.util.Enumeration;
 
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
@@ -47,6 +48,9 @@ import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
+import org.junit.Assert;
+import org.junit.Assume;
+
 import org.apache.catalina.Context;
 import org.apache.catalina.authenticator.SSLAuthenticator;
 import org.apache.catalina.connector.Connector;
@@ -61,6 +65,7 @@ import org.apache.tomcat.util.compat.JrePlatform;
 import org.apache.tomcat.util.descriptor.web.LoginConfig;
 import org.apache.tomcat.util.descriptor.web.SecurityCollection;
 import org.apache.tomcat.util.descriptor.web.SecurityConstraint;
+import org.apache.tomcat.util.net.openssl.OpenSSLImplementation;
 
 public final class TesterSupport {
 
@@ -79,6 +84,9 @@ public final class TesterSupport {
     public static final String LOCALHOST_EC_KEY_PEM = SSL_DIR + "localhost-ec-key.pem";
     public static final String LOCALHOST_RSA_CERT_PEM = SSL_DIR + "localhost-rsa-cert.pem";
     public static final String LOCALHOST_RSA_KEY_PEM = SSL_DIR + "localhost-rsa-key.pem";
+    public static final String CLIENT_CRL_JKS = SSL_DIR + "user2-crl.jks";
+    public static final String EMPTY_CRL = SSL_DIR + "empty-crl.pem";
+    public static final String POPULATED_CRL = SSL_DIR + "populated-crl.pem";
     public static final boolean OPENSSL_AVAILABLE;
     public static final int OPENSSL_VERSION;
     public static final String OPENSSL_ERROR;
@@ -128,10 +136,19 @@ public final class TesterSupport {
     }
 
     public static void initSsl(Tomcat tomcat) {
-        initSsl(tomcat, LOCALHOST_RSA_JKS, null, null);
+        initSsl(tomcat, false);
+    }
+
+    public static void initSsl(Tomcat tomcat, boolean useOpenSSLTrust) {
+        initSsl(tomcat, LOCALHOST_RSA_JKS, useOpenSSLTrust, null, null);
     }
 
     protected static void initSsl(Tomcat tomcat, String keystore,
+            String keystorePass, String keyPass) {
+        initSsl(tomcat, keystore, false, keystorePass, keyPass);
+    }
+
+    protected static void initSsl(Tomcat tomcat, String keystore, boolean useOpenSSLTrust,
             String keystorePass, String keyPass) {
 
         String protocol = tomcat.getConnector().getProtocolHandlerClassName();
@@ -150,9 +167,15 @@ public final class TesterSupport {
                 new File(keystore);
             connector.setAttribute("keystoreFile",
                     keystoreFile.getAbsolutePath());
-            File truststoreFile = new File(CA_JKS);
-            connector.setAttribute("truststoreFile",
-                    truststoreFile.getAbsolutePath());
+            if (useOpenSSLTrust) {
+                File caCertificateFile = new File(CA_CERT_PEM);
+                connector.setAttribute("SSLCACertificateFile",
+                        caCertificateFile.getAbsolutePath());
+            } else {
+                File truststoreFile = new File(CA_JKS);
+                connector.setAttribute("truststoreFile",
+                        truststoreFile.getAbsolutePath());
+            }
             if (keystorePass != null) {
                 connector.setAttribute("keystorePass", keystorePass);
             }
@@ -177,10 +200,37 @@ public final class TesterSupport {
         tomcat.getConnector().setProperty("SSLEnabled", "true");
     }
 
+    public static void configureSSLImplementation(Tomcat tomcat, String sslImplementationName,
+            boolean useOpenSSL) {
+        String protocol = tomcat.getConnector().getProtocolHandlerClassName();
+        if (protocol.contains("Apr")) {
+            // The APR connector always uses OpenSSL
+            Assume.assumeTrue("The APR connector only supports the OpenSSL implementation",
+                    OpenSSLImplementation.class.getName().equals(sslImplementationName));
+            return;
+        }
+        try {
+            Class.forName(sslImplementationName);
+        } catch (Exception e) {
+            Assume.assumeNoException(e);
+        }
+        if (useOpenSSL && OpenSSLImplementation.class.getName().equals(sslImplementationName)) {
+            AprLifecycleListener listener = new AprLifecycleListener();
+            Assume.assumeTrue(AprLifecycleListener.isAprAvailable());
+            StandardServer server = (StandardServer) tomcat.getServer();
+            server.addLifecycleListener(listener);
+        }
+        Assert.assertTrue(tomcat.getConnector().setProperty("sslImplementationName", sslImplementationName));
+    }
+
     protected static KeyManager[] getUser1KeyManagers() throws Exception {
+        return getUserKeyManagers(CLIENT_JKS);
+    }
+
+    protected static KeyManager[] getUserKeyManagers(String keyStore) throws Exception {
         KeyManagerFactory kmf = KeyManagerFactory.getInstance(
                 KeyManagerFactory.getDefaultAlgorithm());
-        kmf.init(getKeyStore(CLIENT_JKS), JKS_PASS.toCharArray());
+        kmf.init(getKeyStore(keyStore), JKS_PASS.toCharArray());
         KeyManager[] managers = kmf.getKeyManagers();
         KeyManager manager;
         for (int i=0; i < managers.length; i++) {
@@ -202,10 +252,19 @@ public final class TesterSupport {
     }
 
     protected static ClientSSLSocketFactory configureClientSsl() {
+        return configureClientSsl(false, CLIENT_JKS);
+    }
+
+    protected static ClientSSLSocketFactory configureClientSsl(boolean forceTls12, String keyStore) {
         ClientSSLSocketFactory clientSSLSocketFactory = null;
         try {
-            SSLContext sc = SSLContext.getInstance(Constants.SSL_PROTO_TLS);
-            sc.init(TesterSupport.getUser1KeyManagers(),
+            SSLContext sc;
+            if (forceTls12) {
+                sc = SSLContext.getInstance(Constants.SSL_PROTO_TLSv1_2);
+            } else {
+                sc = SSLContext.getInstance(Constants.SSL_PROTO_TLS);
+            }
+            sc.init(TesterSupport.getUserKeyManagers(keyStore),
                     TesterSupport.getTrustManagers(),
                     null);
             clientSSLSocketFactory = new ClientSSLSocketFactory(sc.getSocketFactory());
@@ -255,7 +314,12 @@ public final class TesterSupport {
     }
 
     protected static void configureClientCertContext(Tomcat tomcat) {
-        TesterSupport.initSsl(tomcat);
+        configureClientCertContext(tomcat, false, CLIENT_JKS);
+    }
+
+    protected static void configureClientCertContext(Tomcat tomcat, boolean useOpenSSLTrust,
+            String... keyStores) {
+        TesterSupport.initSsl(tomcat, useOpenSSLTrust);
 
         /* When running on Java 11, TLSv1.3 is enabled by default. The JSSE
          * implementation of TLSv1.3 does not support
@@ -293,17 +357,25 @@ public final class TesterSupport {
             throw new RuntimeException(ex);
         }
 
-        String cn = "NOTFOUND";
-        try {
-            KeyStore ks = getKeyStore(CLIENT_JKS);
-            X509Certificate cert = (X509Certificate)ks.getCertificate(CLIENT_ALIAS);
-            cn = cert.getSubjectDN().getName();
-        } catch (Exception ex) {
-            throw new RuntimeException(ex);
-        }
+        // Add the user for each certificate in each key store to the realm and assign each user the standard role
+        for (String keyStore : keyStores) {
+            String cn = "NOTFOUND";
+            try {
+                KeyStore ks = getKeyStore(keyStore);
+                Enumeration<String> aliases = ks.aliases();
+                while (aliases.hasMoreElements()) {
+                    String alias = aliases.nextElement();
+                    X509Certificate cert = (X509Certificate)ks.getCertificate(alias);
+                    cn = cert.getSubjectDN().getName();
 
-        realm.addUser(cn, "not used");
-        realm.addUserRole(cn, ROLE);
+                    realm.addUser(cn, "not used");
+                    realm.addUserRole(cn, ROLE);
+                }
+            } catch (Exception ex) {
+                throw new RuntimeException(ex);
+            }
+
+        }
         ctx.setRealm(realm);
 
         // Configure the authenticator
