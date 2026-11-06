@@ -36,6 +36,7 @@ import org.apache.catalina.WebResourceRoot.ResourceSetType;
 import org.apache.catalina.util.ResourceSet;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.compat.JreCompat;
 import org.apache.tomcat.util.http.RequestUtil;
 
 /**
@@ -44,8 +45,6 @@ import org.apache.tomcat.util.http.RequestUtil;
 public class DirResourceSet extends AbstractFileResourceSet implements WebResourceLockSet {
 
     private static final Log log = LogFactory.getLog(DirResourceSet.class);
-
-    private boolean caseSensitive = true;
 
     private Map<String,ResourceLock> resourceLocksByPath = new HashMap<>();
     private Object resourceLocksByPathLock = new Object();
@@ -292,7 +291,6 @@ public class DirResourceSet extends AbstractFileResourceSet implements WebResour
     @Override
     protected void initInternal() throws LifecycleException {
         super.initInternal();
-        caseSensitive = isCaseSensitive();
         // Is this an exploded web application?
         if (getWebAppMount().equals("")) {
             // Look for a manifest
@@ -305,42 +303,43 @@ public class DirResourceSet extends AbstractFileResourceSet implements WebResour
                 }
             }
         }
-    }
-
-
-    /*
-     * Determines if this ResourceSet is based on a case sensitive file system or not.
-     */
-    private boolean isCaseSensitive() {
-        try {
-            String canonicalPath = getFileBase().getCanonicalPath();
-            File upper = new File(canonicalPath.toUpperCase(Locale.ENGLISH));
-            if (!canonicalPath.equals(upper.getCanonicalPath())) {
-                return true;
-            }
-            File lower = new File(canonicalPath.toLowerCase(Locale.ENGLISH));
-            if (!canonicalPath.equals(lower.getCanonicalPath())) {
-                return true;
-            }
-            /*
-             * Both upper and lower case versions of the current fileBase have the same canonical path so the file
-             * system must be case insensitive.
-             */
-        } catch (IOException ioe) {
-            log.warn(sm.getString("dirResourceSet.isCaseSensitive.fail", getFileBase().getAbsolutePath()), ioe);
+        // Check for exposure to CVE-2024-56337
+        if (isReadOnly()) {
+            // CVE-2024-56337 (nor CVE-2024-50379) is not exploitable on a read-only ResourceSet
+            return;
         }
-
-        return false;
+        if (JreCompat.getInstance().isCanonCachesDisabled()) {
+            // CVE-2024-56337 (nor CVE-2024-50379) is not exploitable if the canonical file name cache is disabled
+            return;
+        }
+        // This ResourceSet may be exposed to CVE-2024-56337.
+        if (JreCompat.getInstance().disableCanonCaches()) {
+            /*
+             * The canonical file name cache was enabled and is now disabled.
+             */
+            log.warn(sm.getString("dirResourceSet.canonCaches.disabled", getFileBase(),
+                    getRoot().getContext().getName()));
+        } else {
+            /*
+             * The canonical file name cache could not be disabled (or Tomcat cannot confirm it has been disabled). This
+             * ResourceSet may be exposed to CVE-2024-56337.
+             */
+            throw new IllegalStateException(sm.getString("dirResourceSet.canonCaches.enabled", getFileBase(),
+                    getRoot().getContext().getName()));
+        }
     }
 
 
     private String getLockKey(String path) {
-        // Normalize path to ensure that the same key is used for the same path.
-        String normalisedPath = RequestUtil.normalize(path);
-        if (caseSensitive) {
-            return normalisedPath;
-        }
-        return normalisedPath.toLowerCase(Locale.ENGLISH);
+        /*
+         * Normalize path to ensure that the same key is used for the same path. Always convert path to lower case as
+         * the file system may be case insensitive. A minor performance improvement is possible by removing the
+         * conversion to lower case for case sensitive file systems but confirming that all the directories within a
+         * DirResourceSet are case sensitive is much harder than it might first appear due to various edge cases. In
+         * particular, Windows can make individual directories case sensitive and File.getCanonicalPath() doesn't return
+         * the canonical file name on Linux for some case insensitive file systems (such as mounted Windows shares).
+         */
+        return RequestUtil.normalize(path).toLowerCase(Locale.ENGLISH);
     }
 
 
