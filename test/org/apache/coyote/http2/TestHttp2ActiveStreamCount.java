@@ -399,6 +399,89 @@ public class TestHttp2ActiveStreamCount extends Http2TestBase {
     }
 
 
+    /*
+     * End to end test (CVE-2020-13943). A stream that is refused because the
+     * maxConcurrentStreams limit has been reached is added to the count of
+     * active streams when its HEADERS frame starts to be processed and the limit
+     * is only enforced once the header block has been fully read and decoded
+     * (so that the HPACK dynamic table stays in sync). The refusal must remove
+     * the stream from the count exactly once: the stream that is genuinely
+     * active must remain counted and the count must return to zero once that
+     * stream completes. A request sent after the refusal reuses the HPACK
+     * dynamic table entries added by the refused request's header block so it
+     * is also handled correctly only if that block was decoded.
+     */
+    @Test
+    public void testStreamRefusedForMaxConcurrentStreamsReturnsActiveStreamCountToZero()
+            throws Exception {
+        HANDLER.set(null);
+
+        // http2Connect() - modified to allow a single concurrent stream
+        enableTesterHttp2();
+        http2Protocol.setMaxConcurrentStreams(1);
+        configureAndStartWebApplication();
+        openClientConnection();
+        doHttpUpgrade();
+        sendClientPreface();
+
+        // validateHttp2InitialResponse() - modified
+        for (int i = 0; i < 5; i++) {
+            parser.readFrame(true);
+        }
+        Assert.assertEquals("0-Settings-[3]-[1]\n" +
+                "0-Settings-End\n" +
+                "0-Settings-Ack\n" +
+                "0-Ping-[0,0,0,0,0,0,0,1]\n" +
+                getSimpleResponseTrace(1),
+                output.getTrace());
+        output.clearTrace();
+
+        Http2UpgradeHandler handler = HANDLER.get();
+        Assert.assertNotNull("Failed to obtain the connection's upgrade handler", handler);
+        awaitActiveStreamCount(handler, 0);
+
+        // Stream 3 uses the only available stream. The connection flow control
+        // window is exhausted by the response so the stream remains active.
+        sendLargeGetRequest(3);
+        // Stream 5 exceeds the limit and is refused.
+        sendSimpleGetRequest(5);
+
+        // 1 * headers + 7 * body (56k-1) + 1 * error for a total of 9 frames
+        // (could be in any order)
+        for (int i = 0; i < 9; i++) {
+            parser.readFrame(true);
+        }
+        Assert.assertTrue(output.getTrace(),
+                output.getTrace().contains("5-RST-[" + Http2Error.REFUSED_STREAM.getCode() + "]"));
+        output.clearTrace();
+
+        // Stream 3 is still active. Stream 5 must not be counted.
+        awaitActiveStreamCount(handler, 1);
+
+        // Release the remaining body
+        sendWindowUpdate(0, (1 << 31) - 2);
+        sendWindowUpdate(3, (1 << 31) - 8193);
+        for (int i = 0; i < 40 && !output.getTrace().contains("3-EndOfStream"); i++) {
+            parser.readFrame(true);
+        }
+        Assert.assertTrue(output.getTrace(), output.getTrace().contains("3-EndOfStream"));
+        output.clearTrace();
+
+        // Stream 3 has completed and stream 5 was refused: nothing is active
+        awaitActiveStreamCount(handler, 0);
+
+        // The header block of the refused stream was decoded so the client and
+        // server HPACK dynamic tables are still in sync and a further request
+        // gets the right response.
+        sendSimpleGetRequest(7);
+        parser.readFrame(true);
+        parser.readFrame(true);
+        Assert.assertEquals(getSimpleResponseTrace(7), output.getTrace());
+        output.clearTrace();
+        awaitActiveStreamCount(handler, 0);
+    }
+
+
     private Http2UpgradeHandler startAndConnect() throws Exception {
         configureAndStartTesterWebApplication();
         openClientConnection();

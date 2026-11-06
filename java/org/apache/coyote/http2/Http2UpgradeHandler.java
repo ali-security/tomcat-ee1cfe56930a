@@ -1510,18 +1510,9 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
             // added to the count of active streams (e.g. trailer headers). Note
             // that the stream may have been created by an earlier PRIORITY
             // frame in which case this is the first time it is counted as
-            // active.
+            // active. The maxConcurrentStreams limit is enforced in
+            // headersEnd() once the header block has been fully processed.
             stream.incrementActiveRemoteStreamCount();
-            if (localSettings.getMaxConcurrentStreams() < activeRemoteStreamCount.get()) {
-                decrementActiveRemoteStreamCount(stream);
-                // Ignoring maxConcurrentStreams increases the overhead count
-                increaseOverheadCount();
-                throw new StreamException(sm.getString("upgradeHandler.tooManyRemoteStreams",
-                        Long.toString(localSettings.getMaxConcurrentStreams())),
-                        Http2Error.REFUSED_STREAM, streamId);
-            }
-            // Valid new stream reduces the overhead count
-            reduceOverheadCount();
             return stream;
         } else {
             if (log.isDebugEnabled()) {
@@ -1589,12 +1580,29 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
 
 
     @Override
-    public void headersEnd(int streamId) throws ConnectionException {
+    public void headersEnd(int streamId) throws Http2Exception {
         Stream stream = getStream(streamId, connectionState.get().isNewStreamAllowed());
         if (stream != null) {
             setMaxProcessedStream(streamId);
             if (stream.isActive()) {
                 if (stream.receivedEndOfHeaders()) {
+
+                    // The limit has to be enforced here, after the HPACK
+                    // encoded header block has been fully read and decoded, so
+                    // that the HPACK dynamic table stays in sync with the
+                    // client's. Refusing the stream earlier, in headersStart(),
+                    // meant the header block was skipped without being decoded.
+                    if (localSettings.getMaxConcurrentStreams() < activeRemoteStreamCount.get()) {
+                        decrementActiveRemoteStreamCount(stream);
+                        // Ignoring maxConcurrentStreams increases the overhead count
+                        increaseOverheadCount();
+                        throw new StreamException(sm.getString("upgradeHandler.tooManyRemoteStreams",
+                                Long.toString(localSettings.getMaxConcurrentStreams())),
+                                Http2Error.REFUSED_STREAM, streamId);
+                    }
+                    // Valid new stream reduces the overhead count
+                    reduceOverheadCount();
+
                     processStreamOnContainerThread(stream);
                 }
             }
