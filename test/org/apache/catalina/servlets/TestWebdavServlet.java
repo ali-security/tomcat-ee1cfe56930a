@@ -26,12 +26,37 @@ import javax.servlet.http.HttpServletResponse;
 import org.junit.Assert;
 import org.junit.Test;
 
+import static org.apache.catalina.startup.SimpleHttpClient.CRLF;
+import org.apache.catalina.Context;
+import org.apache.catalina.Wrapper;
+import org.apache.catalina.startup.SimpleHttpClient;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
 import org.apache.tomcat.util.buf.ByteChunk;
 import org.apache.tomcat.websocket.server.WsContextListener;
 
 public class TestWebdavServlet extends TomcatBaseTest {
+
+    // @formatter:off
+    private static final String LOCK_BODY =
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n" +
+            "<D:lockinfo xmlns:D='DAV:'>\n" +
+            "  <D:lockscope><D:exclusive/></D:lockscope>\n" +
+            "  <D:locktype><D:write/></D:locktype>\n" +
+            "  <D:owner>someone</D:owner>\n" +
+            "</D:lockinfo>";
+
+    private static final String PROPFIND_PROP =
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?> \n" +
+            "<D:propfind xmlns:D=\"DAV:\">\n" +
+            "  <D:prop>\n" +
+            "    <D:getcontenttype/>\n" +
+            "    <T:customprop xmlns:T=\"http://tomcat.apache.org/testsuite\"/>\n" +
+            "    <T:othercustomprop xmlns:T=\"http://tomcat.apache.org/testsuite\"/>\n" +
+            "    <D:getcontentlength/>\n" +
+            "  </D:prop>\n" +
+            "</D:propfind>";
+    // @formatter:on
 
     /*
      * Test attempting to access special paths (WEB-INF/META-INF) using WebdavServlet
@@ -147,6 +172,89 @@ public class TestWebdavServlet extends TomcatBaseTest {
             Map<String, List<String>> resHead) throws IOException {
         out.recycle();
         return TomcatBaseTest.getUrl(path, out, resHead);
+    }
+
+
+    /*
+     * Only tests LOCK bodies exceeding limit. Other tests cover valid LOCK bodies.
+     */
+    @Test
+    public void testLockBodyLimit() throws Exception {
+        doTestLimit("LOCK", LOCK_BODY);
+    }
+
+
+    /*
+     * Only tests PROPFIND bodies exceeding limit. Other tests cover valid PROPFIND bodies.
+     */
+    @Test
+    public void testPropFindBodyLimit() throws Exception {
+        doTestLimit("PROPFIND", PROPFIND_PROP);
+    }
+
+
+    private void doTestLimit(String method, String requestBody) throws Exception {
+
+        Tomcat tomcat = getTomcatInstance();
+
+        File appDir = new File("test/webapp");
+        Context ctxt = tomcat.addContext("", appDir.getAbsolutePath());
+
+        Wrapper webdavServlet = Tomcat.addServlet(ctxt, "webdav", new WebdavServlet());
+        webdavServlet.addInitParameter("listings", "true");
+        webdavServlet.addInitParameter("secret", "foo");
+        webdavServlet.addInitParameter("readonly", "false");
+        webdavServlet.addInitParameter("maxRequestBodySize", "10");
+
+        ctxt.addServletMappingDecoded("/*", "webdav");
+        tomcat.start();
+
+        // With content length
+        Client client = new Client();
+        client.setPort(getPort());
+
+        // @formatter:off
+        client.setRequest(new String[] {
+                method + " / HTTP/1.1" + CRLF +
+                    "Host: localhost:" + getPort() + CRLF +
+                    "Content-Length: " + requestBody.length() + CRLF +
+                    "Connection: Close" + CRLF +
+                    CRLF +
+                    requestBody
+                });
+        // @formatter:on
+        client.connect();
+        client.processRequest(true);
+        Assert.assertEquals(WebdavStatus.SC_REQUEST_TOO_LONG, client.getStatusCode());
+
+        // Without content length
+        client.reset();
+
+        // @formatter:off
+        client.setRequest(new String[] {
+                method + " / HTTP/1.1" + CRLF +
+                    "Host: localhost:" + getPort() + CRLF +
+                    "Transfer-Encoding: chunked" + CRLF +
+                    "Connection: Close" + CRLF +
+                    CRLF +
+                    Integer.toHexString(requestBody.length()) + CRLF +
+                    requestBody + CRLF +
+                    "0" + CRLF +
+                    CRLF
+                });
+        // @formatter:on
+        client.connect();
+        client.processRequest(true);
+        Assert.assertEquals(WebdavStatus.SC_REQUEST_TOO_LONG, client.getStatusCode());
+    }
+
+
+    private static final class Client extends SimpleHttpClient {
+
+        @Override
+        public boolean isResponseBodyOK() {
+            return true;
+        }
     }
 
 }

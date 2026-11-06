@@ -16,6 +16,8 @@
  */
 package org.apache.catalina.servlets;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.Serializable;
@@ -44,6 +46,7 @@ import javax.xml.parsers.ParserConfigurationException;
 import org.apache.catalina.WebResource;
 import org.apache.catalina.connector.RequestFacade;
 import org.apache.catalina.util.DOMWriter;
+import org.apache.catalina.util.IOTools;
 import org.apache.catalina.util.URLEncoder;
 import org.apache.catalina.util.XMLWriter;
 import org.apache.tomcat.util.buf.UDecoder;
@@ -121,6 +124,10 @@ import org.xml.sax.SAXException;
  * necessary access will be able to edit content available via
  * http://host:port/context/content using
  * http://host:port/context/webdavedit/content
+ * <p>
+ * By default, WebDAV request bodies for LOCK and PROPFIND are limited to 4096
+ * bytes. To change this limit, set the <code>maxRequestBodySize</code>
+ * <code>init-param</code> for the WebDAV servlet.
  *
  * @author Remy Maucherat
  *
@@ -193,6 +200,12 @@ public class WebdavServlet extends DefaultServlet {
     private static final int MAX_TIMEOUT = 604800;
 
 
+    /*
+     * Default max request body size.
+     */
+    private static final int DEFAULT_MAX_REQUEST_BODY_SIZE = 4096;
+
+
     /**
      * Default namespace.
      */
@@ -253,6 +266,12 @@ public class WebdavServlet extends DefaultServlet {
 
 
     /**
+     * Maximum size of a WebDAV request body for LOCK and PROPFIND.
+     */
+    private int maxRequestBodySize = DEFAULT_MAX_REQUEST_BODY_SIZE;
+
+
+    /**
      * Is access allowed via WebDAV to the special paths (/WEB-INF and
      * /META-INF)?
      */
@@ -277,6 +296,10 @@ public class WebdavServlet extends DefaultServlet {
         if (getServletConfig().getInitParameter("maxDepth") != null)
             maxDepth = Integer.parseInt(
                     getServletConfig().getInitParameter("maxDepth"));
+
+        if (getServletConfig().getInitParameter("maxRequestBodySize") != null)
+            maxRequestBodySize = Integer.parseInt(
+                    getServletConfig().getInitParameter("maxRequestBodySize"));
 
         if (getServletConfig().getInitParameter("allowSpecialPaths") != null)
             allowSpecialPaths = Boolean.parseBoolean(
@@ -516,12 +539,17 @@ public class WebdavServlet extends DefaultServlet {
 
         Node propNode = null;
 
-        if (req.getContentLengthLong() > 0) {
+        byte[] body = readRequestBody(req, resp);
+        if (body == null) {
+            return;
+        }
+
+        if (body.length > 0) {
             DocumentBuilder documentBuilder = getDocumentBuilder();
 
             try {
                 Document document = documentBuilder.parse
-                    (new InputSource(req.getInputStream()));
+                    (new InputSource(new ByteArrayInputStream(body)));
 
                 // Get the root element of the document
                 Element rootElement = document.getDocumentElement();
@@ -704,6 +732,45 @@ public class WebdavServlet extends DefaultServlet {
 
         generatedXML.sendData();
 
+    }
+
+
+    /**
+     * Read request body
+     *
+     * @param req  The request
+     * @param resp The response
+     *
+     * @return <code>null</code> if the body could not be read and an error
+     *         status code has been set, otherwise the request body as a byte
+     *         array
+     *
+     * @throws IOException if the reading the body fails and a response status
+     *         code cannot be set
+     */
+    private byte[] readRequestBody(HttpServletRequest req, HttpServletResponse resp)
+            throws IOException {
+        // Short-cut if client provided a content length
+        if (req.getContentLengthLong() > maxRequestBodySize) {
+            resp.sendError(WebdavStatus.SC_REQUEST_TOO_LONG);
+            return null;
+        }
+
+        byte[] body;
+        try (InputStream is = req.getInputStream();
+                BoundedByteArrayOutputStream os =
+                        new BoundedByteArrayOutputStream(maxRequestBodySize)) {
+            IOTools.flow(is, os);
+            body = os.toByteArray();
+        } catch (IOException ioe) {
+            resp.sendError(WebdavStatus.SC_BAD_REQUEST);
+            return null;
+        } catch (ArrayIndexOutOfBoundsException e) {
+            resp.sendError(WebdavStatus.SC_REQUEST_TOO_LONG);
+            return null;
+        }
+
+        return body;
     }
 
 
@@ -971,18 +1038,27 @@ public class WebdavServlet extends DefaultServlet {
 
         Node lockInfoNode = null;
 
-        DocumentBuilder documentBuilder = getDocumentBuilder();
+        byte[] body = readRequestBody(req, resp);
+        if (body == null) {
+            return;
+        }
 
-        try {
-            Document document = documentBuilder.parse(new InputSource
-                (req.getInputStream()));
+        if (body.length > 0) {
+            DocumentBuilder documentBuilder = getDocumentBuilder();
 
-            // Get the root element of the document
-            Element rootElement = document.getDocumentElement();
-            lockInfoNode = rootElement;
-        } catch (IOException e) {
-            lockRequestType = LOCK_REFRESH;
-        } catch (SAXException e) {
+            try {
+                Document document = documentBuilder.parse(new InputSource
+                    (new ByteArrayInputStream(body)));
+
+                // Get the root element of the document
+                Element rootElement = document.getDocumentElement();
+                lockInfoNode = rootElement;
+            } catch (IOException e) {
+                lockRequestType = LOCK_REFRESH;
+            } catch (SAXException e) {
+                lockRequestType = LOCK_REFRESH;
+            }
+        } else {
             lockRequestType = LOCK_REFRESH;
         }
 
@@ -2507,6 +2583,42 @@ public class WebdavServlet extends DefaultServlet {
                     publicId, systemId));
             return new InputSource(
                     new StringReader("Ignored external entity"));
+        }
+    }
+
+
+    static class BoundedByteArrayOutputStream extends ByteArrayOutputStream {
+
+        private final int sizeLimit;
+        private int size;
+
+        BoundedByteArrayOutputStream(int sizeLimit) {
+            super();
+            this.sizeLimit = sizeLimit;
+        }
+
+        @Override
+        public synchronized void write(int b) {
+            size++;
+            if (size > sizeLimit) {
+                throw new ArrayIndexOutOfBoundsException();
+            }
+            super.write(b);
+        }
+
+        @Override
+        public synchronized void write(byte[] b, int off, int len) {
+            size += len;
+            if (size > sizeLimit) {
+                throw new ArrayIndexOutOfBoundsException();
+            }
+            super.write(b, off, len);
+        }
+
+        @Override
+        public synchronized void reset() {
+            size = 0;
+            super.reset();
         }
     }
 }
