@@ -20,8 +20,17 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.CompletionHandler;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import javax.servlet.ServletInputStream;
 import javax.servlet.ServletOutputStream;
@@ -64,6 +73,12 @@ import org.apache.tomcat.util.net.SocketWrapperBase;
  * parse an unrelated request into the same array. The pending copy then hands
  * that other request's bytes to this connection - which is exactly the request
  * mix-up reported as CVE-2021-25122.
+ * <p>
+ * The tests that follow those target CVE-2021-43980 (a processor is recycled
+ * while it is still being used). The connection handler has to take complete
+ * ownership of the processor while it is processing so that a concurrent
+ * {@link AbstractProtocol.ConnectionHandler#release(SocketWrapperBase)} - the
+ * endpoint closing the connection from another thread - cannot recycle it.
  */
 public class TestAbstractProtocol {
 
@@ -162,6 +177,357 @@ public class TestAbstractProtocol {
                 " connection was handed another connection's request bytes" +
                 " (CVE-2021-25122)",
                 PIPELINED_BY_THIS_CLIENT, readAllBufferedInput(wrapper));
+    }
+
+
+    /**
+     * {@link SocketWrapperBase#takeCurrentProcessor()} returns the current
+     * processor and clears it.
+     */
+    @Test
+    public void testTakeCurrentProcessor() throws Exception {
+        TesterSocketWrapper wrapper = new TesterSocketWrapper(new NioEndpoint());
+        Object processor = new Object();
+
+        Assert.assertNull(wrapper.takeCurrentProcessor());
+
+        wrapper.setCurrentProcessor(processor);
+        Assert.assertSame(processor, wrapper.getCurrentProcessor());
+        Assert.assertSame(processor, wrapper.takeCurrentProcessor());
+        Assert.assertNull(wrapper.getCurrentProcessor());
+        Assert.assertNull(wrapper.takeCurrentProcessor());
+    }
+
+
+    /**
+     * Only one of several threads racing to take the current processor may
+     * obtain it. This is what stops two threads recycling the same processor.
+     */
+    @Test
+    public void testTakeCurrentProcessorIsAtomic() throws Exception {
+        int threadCount = 8;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        try {
+            for (int round = 0; round < 50; round++) {
+                TesterSocketWrapper wrapper = new TesterSocketWrapper(new NioEndpoint());
+                Object processor = new Object();
+                wrapper.setCurrentProcessor(processor);
+
+                CyclicBarrier barrier = new CyclicBarrier(threadCount);
+                List<Future<Object>> results = new ArrayList<>();
+                for (int i = 0; i < threadCount; i++) {
+                    results.add(executor.submit(() -> {
+                        barrier.await(10, TimeUnit.SECONDS);
+                        return wrapper.takeCurrentProcessor();
+                    }));
+                }
+                int taken = 0;
+                for (Future<Object> result : results) {
+                    Object value = result.get(10, TimeUnit.SECONDS);
+                    if (value != null) {
+                        Assert.assertSame(processor, value);
+                        taken++;
+                    }
+                }
+                Assert.assertEquals("The processor must be taken by exactly one thread", 1, taken);
+                Assert.assertNull(wrapper.getCurrentProcessor());
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+
+    /**
+     * While the handler is processing an event the processor belongs to the
+     * handler: it is not associated with the wrapper. Afterwards it is either
+     * associated with the wrapper again (the connection continues to need it)
+     * or it has been released exactly once.
+     */
+    @Test
+    public void testProcessorOwnershipDuringAndAfterProcessing() throws Exception {
+        // LONG: processor stays associated with the wrapper
+        TesterRecyclableProcessor longProcessor = new TesterRecyclableProcessor(SocketState.LONG);
+        TesterSocketWrapper wrapper = doProcess(longProcessor);
+        Assert.assertNull("The wrapper must not be associated with the processor while it is processing",
+                longProcessor.getCurrentProcessorSeenWhileProcessing());
+        Assert.assertSame(longProcessor, wrapper.getCurrentProcessor());
+        Assert.assertEquals(0, longProcessor.getRecycleCount());
+
+        // OPEN: processor released and no longer associated with the wrapper
+        TesterRecyclableProcessor openProcessor = new TesterRecyclableProcessor(SocketState.OPEN);
+        wrapper = doProcess(openProcessor);
+        Assert.assertNull(openProcessor.getCurrentProcessorSeenWhileProcessing());
+        Assert.assertNull(wrapper.getCurrentProcessor());
+        Assert.assertEquals(1, openProcessor.getRecycleCount());
+
+        // CLOSED: processor released and no longer associated with the wrapper
+        TesterRecyclableProcessor closedProcessor = new TesterRecyclableProcessor(SocketState.CLOSED);
+        wrapper = doProcess(closedProcessor);
+        Assert.assertNull(closedProcessor.getCurrentProcessorSeenWhileProcessing());
+        Assert.assertNull(wrapper.getCurrentProcessor());
+        Assert.assertEquals(1, closedProcessor.getRecycleCount());
+    }
+
+
+    private static TesterSocketWrapper doProcess(TesterRecyclableProcessor processor)
+            throws Exception {
+        TesterProtocol protocol = new TesterProtocol(false);
+        AbstractProtocol.ConnectionHandler<NioChannel> handler =
+                new AbstractProtocol.ConnectionHandler<>(protocol);
+        Deque<Processor> processors = new ArrayDeque<>();
+        processors.add(processor);
+        protocol.setProcessorFactory(processors::remove);
+
+        TesterSocketWrapper wrapper = new TesterSocketWrapper(protocol.getTesterEndpoint());
+        Assert.assertEquals(processor.getResult(), handler.process(wrapper, SocketEvent.OPEN_READ));
+        return wrapper;
+    }
+
+
+    /**
+     * The endpoint releasing a connection (e.g. because it was closed by the
+     * client) from another thread while the connection is being processed must
+     * not recycle the processor that is in use. If it did, the processor could
+     * be handed to a second connection while the first is still using it, with
+     * responses (or part responses) going to the wrong client (CVE-2021-43980).
+     */
+    @Test
+    public void testConcurrentReleaseDoesNotRecycleProcessorInUse() throws Exception {
+        TesterProtocol protocol = new TesterProtocol(false);
+        AbstractProtocol.ConnectionHandler<NioChannel> handler =
+                new AbstractProtocol.ConnectionHandler<>(protocol);
+
+        TesterSocketWrapper wrapper = new TesterSocketWrapper(protocol.getTesterEndpoint());
+        TesterSocketWrapper otherWrapper = new TesterSocketWrapper(protocol.getTesterEndpoint());
+
+        TesterRecyclableProcessor inUse = new TesterRecyclableProcessor(SocketState.LONG);
+        TesterRecyclableProcessor spare = new TesterRecyclableProcessor(SocketState.LONG);
+        Deque<Processor> processors = new ArrayDeque<>();
+        processors.add(inUse);
+        processors.add(spare);
+        protocol.setProcessorFactory(processors::remove);
+
+        // While 'inUse' is processing, another thread (e.g. the poller handling
+        // a closed connection) releases the wrapper.
+        inUse.setWhileProcessing(() -> {
+            Thread other = new Thread(() -> handler.release(wrapper));
+            other.start();
+            try {
+                other.join(10000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            inUse.recycleCountAfterConcurrentRelease = inUse.getRecycleCount();
+        });
+
+        Assert.assertEquals(SocketState.LONG, handler.process(wrapper, SocketEvent.OPEN_READ));
+
+        Assert.assertEquals("The processor was recycled while it was still in use",
+                0, inUse.recycleCountAfterConcurrentRelease);
+        Assert.assertEquals(0, inUse.getRecycleCount());
+        Assert.assertSame(inUse, wrapper.getCurrentProcessor());
+
+        // A second connection must not be given the processor that is in use
+        Assert.assertEquals(SocketState.LONG, handler.process(otherWrapper, SocketEvent.OPEN_READ));
+        Assert.assertEquals(1, inUse.getProcessCount());
+        Assert.assertSame(wrapper, inUse.getLastWrapper());
+        Assert.assertEquals(1, spare.getProcessCount());
+        Assert.assertSame(otherWrapper, spare.getLastWrapper());
+    }
+
+
+    /**
+     * Releasing a connection recycles the processor associated with it exactly
+     * once however many times the endpoint calls release.
+     */
+    @Test
+    public void testReleaseWrapperRecyclesProcessorOnce() throws Exception {
+        TesterProtocol protocol = new TesterProtocol(false);
+        AbstractProtocol.ConnectionHandler<NioChannel> handler =
+                new AbstractProtocol.ConnectionHandler<>(protocol);
+        TesterSocketWrapper wrapper = new TesterSocketWrapper(protocol.getTesterEndpoint());
+
+        TesterRecyclableProcessor processor = new TesterRecyclableProcessor(SocketState.LONG);
+        wrapper.setCurrentProcessor(processor);
+
+        handler.release(wrapper);
+        handler.release(wrapper);
+
+        Assert.assertEquals(1, processor.getRecycleCount());
+        Assert.assertNull(wrapper.getCurrentProcessor());
+    }
+
+
+    /**
+     * A timeout event that turns out not to be required is a NO-OP. It must
+     * leave the processor associated with the connection so that the next
+     * event for the connection is processed by the same processor.
+     */
+    @Test
+    public void testNoOpTimeoutKeepsProcessorAssociatedWithWrapper() throws Exception {
+        TesterProtocol protocol = new TesterProtocol(false);
+        AbstractProtocol.ConnectionHandler<NioChannel> handler =
+                new AbstractProtocol.ConnectionHandler<>(protocol);
+        TesterSocketWrapper wrapper = new TesterSocketWrapper(protocol.getTesterEndpoint());
+
+        // Neither async nor an upgrade so a timeout is not required
+        TesterRecyclableProcessor processor = new TesterRecyclableProcessor(SocketState.LONG);
+        wrapper.setCurrentProcessor(processor);
+
+        Assert.assertEquals(SocketState.OPEN, handler.process(wrapper, SocketEvent.TIMEOUT));
+
+        Assert.assertEquals(0, processor.getProcessCount());
+        Assert.assertEquals(0, processor.getRecycleCount());
+        Assert.assertSame(processor, wrapper.getCurrentProcessor());
+    }
+
+
+    /**
+     * Direct HTTP/2 connection ({@code upgradeToken == null}) when no h2c
+     * upgrade protocol is available: the connection is closed and the HTTP/1.1
+     * processor, which the handler owns, must be released (recycled) rather
+     * than being dropped.
+     */
+    @Test
+    public void testDirectHttp2WithoutH2cReleasesProcessor() throws Exception {
+        TesterProtocol protocol = new TesterProtocol(false);
+        protocol.setH2cAvailable(false);
+        AbstractProtocol.ConnectionHandler<NioChannel> handler =
+                new AbstractProtocol.ConnectionHandler<>(protocol);
+        TesterSocketWrapper wrapper = new TesterSocketWrapper(protocol.getTesterEndpoint());
+        TesterSocketWrapper otherWrapper = new TesterSocketWrapper(protocol.getTesterEndpoint());
+
+        TesterRecyclableProcessor processor = new TesterRecyclableProcessor(SocketState.UPGRADING);
+        processor.setResultForSubsequentCalls(SocketState.CLOSED);
+        Deque<Processor> processors = new ArrayDeque<>();
+        processors.add(processor);
+        protocol.setProcessorFactory(processors::remove);
+
+        Assert.assertEquals(SocketState.CLOSED, handler.process(wrapper, SocketEvent.OPEN_READ));
+
+        Assert.assertEquals("The HTTP/1.1 processor was not released", 1, processor.getRecycleCount());
+        Assert.assertNull(wrapper.getCurrentProcessor());
+
+        // The released processor is available to serve another connection (no
+        // new processor is created: the factory is empty)
+        Assert.assertEquals(SocketState.CLOSED, handler.process(otherWrapper, SocketEvent.OPEN_READ));
+        Assert.assertSame(otherWrapper, processor.getLastWrapper());
+        Assert.assertEquals(2, processor.getRecycleCount());
+    }
+
+
+    /**
+     * An HTTP/1.1 processor that reports what it sees of its wrapper while it
+     * is processing and counts how often it is recycled.
+     */
+    private static class TesterRecyclableProcessor implements Processor {
+
+        private final SocketState result;
+        private SocketState resultForSubsequentCalls;
+        private Runnable whileProcessing = null;
+        private int processCount = 0;
+        private int recycleCount = 0;
+        private SocketWrapperBase<?> lastWrapper = null;
+        private Object currentProcessorSeenWhileProcessing = null;
+        volatile int recycleCountAfterConcurrentRelease = -1;
+
+        TesterRecyclableProcessor(SocketState result) {
+            this.result = result;
+            this.resultForSubsequentCalls = result;
+        }
+
+        SocketState getResult() {
+            return result;
+        }
+
+        void setResultForSubsequentCalls(SocketState resultForSubsequentCalls) {
+            this.resultForSubsequentCalls = resultForSubsequentCalls;
+        }
+
+        void setWhileProcessing(Runnable whileProcessing) {
+            this.whileProcessing = whileProcessing;
+        }
+
+        int getProcessCount() {
+            return processCount;
+        }
+
+        int getRecycleCount() {
+            return recycleCount;
+        }
+
+        SocketWrapperBase<?> getLastWrapper() {
+            return lastWrapper;
+        }
+
+        Object getCurrentProcessorSeenWhileProcessing() {
+            return currentProcessorSeenWhileProcessing;
+        }
+
+        @Override
+        public SocketState process(SocketWrapperBase<?> socketWrapper, SocketEvent status) {
+            processCount++;
+            lastWrapper = socketWrapper;
+            currentProcessorSeenWhileProcessing = socketWrapper.getCurrentProcessor();
+            if (whileProcessing != null) {
+                whileProcessing.run();
+            }
+            return processCount == 1 ? result : resultForSubsequentCalls;
+        }
+
+        @Override
+        public UpgradeToken getUpgradeToken() {
+            // Direct HTTP/2 connection
+            return null;
+        }
+
+        @Override
+        public ByteBuffer getLeftoverInput() {
+            return ByteBuffer.allocate(0);
+        }
+
+        @Override
+        public void recycle() {
+            recycleCount++;
+        }
+
+        @Override
+        public boolean isUpgrade() {
+            // Must be false so that release() returns this processor to the
+            // pool of recycled processors, as it does for Http11Processor.
+            return false;
+        }
+
+        @Override
+        public boolean isAsync() {
+            return false;
+        }
+
+        @Override
+        public void timeoutAsync(long now) {
+            // NO-OP
+        }
+
+        @Override
+        public Request getRequest() {
+            return null;
+        }
+
+        @Override
+        public void setSslSupport(SSLSupport sslSupport) {
+            // NO-OP
+        }
+
+        @Override
+        public void pause() {
+            // NO-OP
+        }
+
+        @Override
+        public boolean checkAsyncTimeoutGeneration() {
+            return false;
+        }
     }
 
 
@@ -396,6 +762,8 @@ public class TestAbstractProtocol {
         private AbstractProtocol.ConnectionHandler<NioChannel> handler;
         private SocketWrapperBase<NioChannel> otherWrapper;
         private boolean concurrentConnectionServed = false;
+        private Supplier<Processor> processorFactory = null;
+        private boolean h2cAvailable = true;
 
         TesterProtocol(boolean useUpgradeToken) {
             this(useUpgradeToken, new NioEndpoint());
@@ -418,6 +786,22 @@ public class TestAbstractProtocol {
         }
 
         /**
+         * Supplies the processors returned by {@link #createProcessor()}. If
+         * not set, creating a processor is a test failure.
+         */
+        void setProcessorFactory(Supplier<Processor> processorFactory) {
+            this.processorFactory = processorFactory;
+        }
+
+        /**
+         * Controls whether the h2c upgrade protocol is available for a direct
+         * HTTP/2 connection ({@code upgradeToken == null}).
+         */
+        void setH2cAvailable(boolean h2cAvailable) {
+            this.h2cAvailable = h2cAvailable;
+        }
+
+        /**
          * Serves an unrelated connection through the connection handler. The
          * handler will take the just released HTTP/1.1 processor from the shared
          * pool of recycled processors and parse a request into its input buffer.
@@ -432,7 +816,7 @@ public class TestAbstractProtocol {
 
         @Override
         protected UpgradeProtocol getUpgradeProtocol(String name) {
-            if (useUpgradeToken || !"h2c".equals(name)) {
+            if (useUpgradeToken || !h2cAvailable || !"h2c".equals(name)) {
                 return null;
             }
             return new TesterUpgradeProtocol();
@@ -447,7 +831,10 @@ public class TestAbstractProtocol {
 
         @Override
         protected Processor createProcessor() {
-            throw new IllegalStateException("A new processor should not be required");
+            if (processorFactory == null) {
+                throw new IllegalStateException("A new processor should not be required");
+            }
+            return processorFactory.get();
         }
 
         @Override

@@ -773,7 +773,11 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
 
             S socket = wrapper.getSocket();
 
-            Processor processor = (Processor) wrapper.getCurrentProcessor();
+            // We take complete ownership of the Processor inside of this method to ensure
+            // no other thread can release it while we're using it. Whatever processor is
+            // held by this variable will be associated with the SocketWrapper before this
+            // method returns.
+            Processor processor = (Processor) wrapper.takeCurrentProcessor();
             if (getLog().isDebugEnabled()) {
                 getLog().debug(sm.getString("abstractConnectionHandler.connectionsGet",
                         processor, socket));
@@ -788,6 +792,11 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
                     !processor.isAsync() && !processor.isUpgrade() ||
                     processor.isAsync() && !processor.checkAsyncTimeoutGeneration())) {
                 // This is effectively a NO-OP
+                if (processor != null) {
+                    // The processor was taken above. Hand it back so it stays
+                    // associated with the wrapper.
+                    wrapper.setCurrentProcessor(processor);
+                }
                 return SocketState.OPEN;
             }
 
@@ -856,9 +865,6 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
                 processor.setSslSupport(
                         wrapper.getSslSupport(getProtocol().getClientCertProvider()));
 
-                // Associate the processor with the connection
-                wrapper.setCurrentProcessor(processor);
-
                 SocketState state = SocketState.CLOSED;
                 do {
                     state = processor.process(wrapper, status);
@@ -879,7 +885,8 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
                                 // Create the upgrade processor
                                 processor = upgradeProtocol.getProcessor(
                                         wrapper, getProtocol().getAdapter());
-                                // Associate with the processor with the connection
+                                // Associate with the processor with the connection, as
+                                // for any other upgrade (see below)
                                 wrapper.setCurrentProcessor(processor);
                             } else {
                                 if (getLog().isDebugEnabled()) {
@@ -887,7 +894,8 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
                                         "abstractConnectionHandler.negotiatedProcessor.fail",
                                         "h2c"));
                                 }
-                                return SocketState.CLOSED;
+                                // Exit loop and trigger appropriate clean-up
+                                state = SocketState.CLOSED;
                             }
                         } else {
                             HttpUpgradeHandler httpUpgradeHandler = upgradeToken.getHttpUpgradeHandler();
@@ -901,7 +909,11 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
                             }
                             // Mark the connection as upgraded
                             wrapper.setUpgraded(true);
-                            // Associate with the processor with the connection
+                            // Associate with the processor with the connection. The
+                            // upgrade handler's init() below may block on I/O (HTTP/2
+                            // reads the client preface there), so pause() and
+                            // release(SocketWrapperBase) have to be able to reach the
+                            // processor while it runs.
                             wrapper.setCurrentProcessor(processor);
                             // Initialise the upgrade handler (which may trigger
                             // some IO using the new protocol which is why the lines
@@ -940,8 +952,8 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
                 } else if (state == SocketState.OPEN) {
                     // In keep-alive but between requests. OK to recycle
                     // processor. Continue to poll for the next request.
-                    wrapper.setCurrentProcessor(null);
                     release(processor);
+                    processor = null;
                     wrapper.registerReadInterest();
                 } else if (state == SocketState.SENDFILE) {
                     // Sendfile in progress. If it fails, the socket will be
@@ -966,8 +978,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
                     // Connection closed. OK to recycle the processor.
                     // Processors handling upgrades require additional clean-up
                     // before release.
-                    wrapper.setCurrentProcessor(null);
-                    if (processor.isUpgrade()) {
+                    if (processor != null && processor.isUpgrade()) {
                         UpgradeToken upgradeToken = processor.getUpgradeToken();
                         HttpUpgradeHandler httpUpgradeHandler = upgradeToken.getHttpUpgradeHandler();
                         InstanceManager instanceManager = upgradeToken.getInstanceManager();
@@ -988,7 +999,13 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
                             }
                         }
                     }
+
                     release(processor);
+                    processor = null;
+                }
+
+                if (processor != null) {
+                    wrapper.setCurrentProcessor(processor);
                 }
                 return state;
             } catch(java.net.SocketException e) {
@@ -1026,7 +1043,6 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
 
             // Make sure socket/processor is removed from the list of current
             // connections
-            wrapper.setCurrentProcessor(null);
             release(processor);
             return SocketState.CLOSED;
         }
@@ -1060,7 +1076,9 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
 
         /**
          * Expected to be used by the handler once the processor is no longer
-         * required.
+         * required. Care must be taken to ensure that this method is only
+         * called once per processor, after the request processing has
+         * completed.
          *
          * @param processor Processor being released (that was associated with
          *                  the socket)
@@ -1099,8 +1117,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
          */
         @Override
         public void release(SocketWrapperBase<S> socketWrapper) {
-            Processor processor = (Processor) socketWrapper.getCurrentProcessor();
-            socketWrapper.setCurrentProcessor(null);
+            Processor processor = (Processor) socketWrapper.takeCurrentProcessor();
             release(processor);
         }
 
