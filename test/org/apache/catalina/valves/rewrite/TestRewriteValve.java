@@ -889,4 +889,15 @@ public class TestRewriteValve extends TomcatBaseTest {
             Assert.assertEquals(expectedStatusCode, rc);
         }
     }
+
+    @Test
+    public void testOrCondDoesNotSkipNonOrCond() throws Exception {
+        // The condition after the one covered by [OR] must still be evaluated
+        doTestRewrite(
+                "RewriteCond %{HTTP_HOST} localhost [OR]\n" +
+                "RewriteCond %{HTTP_HOST} 127.0.0.1\n" +
+                "RewriteCond %{REQUEST_URI} ^/admin\n" +
+                "RewriteRule ^(.*) /c/blocked$1",
+                "/c/other", "/c/other");
+    }
 }

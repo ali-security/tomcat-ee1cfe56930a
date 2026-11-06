@@ -225,11 +225,6 @@ public class RewriteValve extends ValveBase {
                         containerLog.debug("Add rule with pattern " + rule.getPatternString()
                                 + " and substitution " + rule.getSubstitutionString());
                     }
-                    for (int i = (conditions.size() - 1); i > 0; i--) {
-                        if (conditions.get(i - 1).isOrnext()) {
-                            conditions.get(i).setOrnext(true);
-                        }
-                    }
                     for (int i = 0; i < conditions.size(); i++) {
                         if (containerLog.isDebugEnabled()) {
                             RewriteCond cond = conditions.get(i);
