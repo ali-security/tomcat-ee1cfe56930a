@@ -17,12 +17,22 @@
 package org.apache.catalina.realm;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.Principal;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Hashtable;
+import java.util.List;
 
+import javax.naming.AuthenticationException;
+import javax.naming.CommunicationException;
 import javax.naming.NamingEnumeration;
 import javax.naming.NamingException;
+import javax.naming.directory.Attributes;
 import javax.naming.directory.BasicAttributes;
 import javax.naming.directory.DirContext;
 import javax.naming.directory.InitialDirContext;
@@ -51,6 +61,10 @@ public class TestJNDIRealm {
     private static final String NONCE = "test-nonce";
     private static final String HA2 = "test-md5a2";
     public static final String USER_PASSWORD_ATTR = "test-pwd";
+
+    private static final String USER_PATTERN = "uid={0},ou=people,dc=example,dc=com";
+    private static final String USER_DN = "uid=" + USER + ",ou=people,dc=example,dc=com";
+    private static final String WRONG_PASSWORD = "wrong-password";
 
     private static MessageDigest md5Helper;
 
@@ -107,6 +121,135 @@ public class TestJNDIRealm {
         // THEN
         Assert.assertTrue(principal instanceof GenericPrincipal);
         Assert.assertEquals(ha1(), ((GenericPrincipal)principal).getPassword());
+    }
+
+    @Test
+    public void testBindAsUserAuthenticationNoneWrongPassword() throws Exception {
+        doTestBindAsUser("none", WRONG_PASSWORD, false);
+    }
+
+    @Test
+    public void testBindAsUserAuthenticationNoneCorrectPassword() throws Exception {
+        doTestBindAsUser("none", PASSWORD, true);
+    }
+
+    @Test
+    public void testBindAsUserAuthenticationExternalWrongPassword() throws Exception {
+        doTestBindAsUser("EXTERNAL", WRONG_PASSWORD, false);
+    }
+
+    @Test
+    public void testBindAsUserAuthenticationExternalCorrectPassword() throws Exception {
+        doTestBindAsUser("EXTERNAL", PASSWORD, true);
+    }
+
+    @Test
+    public void testBindAsUserAuthenticationSimpleWrongPassword() throws Exception {
+        doTestBindAsUser("simple", WRONG_PASSWORD, false);
+    }
+
+    @Test
+    public void testBindAsUserAuthenticationSimpleCorrectPassword() throws Exception {
+        doTestBindAsUser("simple", PASSWORD, true);
+    }
+
+    @Test
+    public void testBindAsUserAuthenticationDefaultWrongPassword() throws Exception {
+        doTestBindAsUser(null, WRONG_PASSWORD, false);
+    }
+
+    @Test
+    public void testBindAsUserAuthenticationDefaultCorrectPassword() throws Exception {
+        doTestBindAsUser(null, PASSWORD, true);
+    }
+
+    @Test
+    public void testBindAsUserRestoresEnvironmentOnError() throws Exception {
+        // GIVEN
+        JNDIRealm realm = buildBindRealm("EXTERNAL");
+        DirContext dirContext = getDirContext(realm);
+        TesterLdapDirContext ldap = (TesterLdapDirContext) Proxy.getInvocationHandler(dirContext);
+        ldap.setBindFailure(new CommunicationException("test-connection-failure"));
+
+        // WHEN
+        try {
+            realm.bindAsUser(dirContext,
+                    new JNDIRealm.User(USER, USER_DN, null, null, null), WRONG_PASSWORD);
+            Assert.fail("Expected the bind failure to be propagated");
+        } catch (CommunicationException expected) {
+            // Expected
+        }
+
+        // THEN
+        Assert.assertEquals(Collections.singletonList("simple"), ldap.getBindMechanisms());
+        assertEnvironmentRestored(ldap, "EXTERNAL");
+    }
+
+
+    private void doTestBindAsUser(String authentication, String password,
+            boolean expectAuthenticated) throws Exception {
+        // GIVEN
+        JNDIRealm realm = buildBindRealm(authentication);
+        TesterLdapDirContext ldap =
+                (TesterLdapDirContext) Proxy.getInvocationHandler(getDirContext(realm));
+
+        // WHEN
+        Principal principal = realm.authenticate(USER, password);
+
+        // THEN
+        if (expectAuthenticated) {
+            Assert.assertTrue(principal instanceof GenericPrincipal);
+            Assert.assertEquals(USER, principal.getName());
+        } else {
+            Assert.assertNull(principal);
+        }
+        // The user provided credentials must have been checked with a simple
+        // bind, regardless of the configured authentication mechanism
+        Assert.assertEquals(Collections.singletonList("simple"), ldap.getBindMechanisms());
+        assertEnvironmentRestored(ldap, authentication);
+    }
+
+
+    private void assertEnvironmentRestored(TesterLdapDirContext ldap, String authentication) {
+        Hashtable<Object,Object> env = ldap.getEnvironment();
+        // The configured authentication mechanism must have been restored
+        Assert.assertEquals(Boolean.valueOf(authentication != null),
+                Boolean.valueOf(env.containsKey(javax.naming.Context.SECURITY_AUTHENTICATION)));
+        Assert.assertEquals(authentication, env.get(javax.naming.Context.SECURITY_AUTHENTICATION));
+        // The user's credentials must have been removed
+        Assert.assertNull(env.get(javax.naming.Context.SECURITY_PRINCIPAL));
+        Assert.assertNull(env.get(javax.naming.Context.SECURITY_CREDENTIALS));
+    }
+
+
+    private JNDIRealm buildBindRealm(String authentication) throws Exception {
+        Context context = new TesterContext();
+        JNDIRealm realm = new JNDIRealm();
+        realm.setContainer(context);
+        realm.setAuthentication(authentication);
+        realm.setUserPattern(USER_PATTERN);
+        realm.init();
+
+        // Use the environment the realm would use to connect to the directory
+        DirContext dirContext = (DirContext) Proxy.newProxyInstance(
+                TestJNDIRealm.class.getClassLoader(), new Class<?>[] { DirContext.class },
+                new TesterLdapDirContext(realm.getDirectoryContextEnvironment()));
+
+        Field field = JNDIRealm.class.getDeclaredField("context");
+        field.setAccessible(true);
+        field.set(realm, dirContext);
+
+        realm.start();
+
+        return realm;
+    }
+
+
+    private DirContext getDirContext(JNDIRealm realm)
+            throws NoSuchFieldException, IllegalAccessException {
+        Field field = JNDIRealm.class.getDeclaredField("context");
+        field.setAccessible(true);
+        return (DirContext) field.get(realm);
     }
 
 
@@ -170,5 +313,77 @@ public class TestJNDIRealm {
     private String ha1() {
         String a1 = USER + ":" + REALM + ":" + PASSWORD;
         return MD5Encoder.encode(md5Helper.digest(a1.getBytes()));
+    }
+
+
+    /*
+     * Minimal stand-in for an LDAP DirContext. Reading the root DSE emulates
+     * the bind performed by the JNDI LDAP provider: only a simple bind (the
+     * default when credentials are present and no mechanism is configured)
+     * checks the supplied password. A "none" bind is anonymous and an
+     * "EXTERNAL" bind relies on the TLS client certificate so both succeed
+     * whatever password was provided.
+     */
+    private static class TesterLdapDirContext implements InvocationHandler {
+
+        private final Hashtable<Object,Object> environment = new Hashtable<>();
+        private final List<Object> bindMechanisms = new ArrayList<>();
+        private NamingException bindFailure = null;
+
+        TesterLdapDirContext(Hashtable<String,String> initialEnvironment) {
+            environment.putAll(initialEnvironment);
+        }
+
+        Hashtable<Object,Object> getEnvironment() {
+            return environment;
+        }
+
+        List<Object> getBindMechanisms() {
+            return bindMechanisms;
+        }
+
+        void setBindFailure(NamingException bindFailure) {
+            this.bindFailure = bindFailure;
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            switch (method.getName()) {
+                case "getEnvironment":
+                    return environment.clone();
+                case "addToEnvironment":
+                    return environment.put(args[0], args[1]);
+                case "removeFromEnvironment":
+                    return environment.remove(args[0]);
+                case "getAttributes":
+                    return bind();
+                case "close":
+                    return null;
+                case "hashCode":
+                    return Integer.valueOf(System.identityHashCode(proxy));
+                case "equals":
+                    return Boolean.valueOf(proxy == args[0]);
+                case "toString":
+                    return TesterLdapDirContext.class.getSimpleName();
+                default:
+                    throw new UnsupportedOperationException(method.toString());
+            }
+        }
+
+        private Attributes bind() throws NamingException {
+            Object mechanism = environment.get(javax.naming.Context.SECURITY_AUTHENTICATION);
+            bindMechanisms.add(mechanism);
+            if (bindFailure != null) {
+                throw bindFailure;
+            }
+            if (mechanism == null || "simple".equalsIgnoreCase(mechanism.toString())) {
+                if (!USER_DN.equals(environment.get(javax.naming.Context.SECURITY_PRINCIPAL)) ||
+                        !PASSWORD.equals(environment.get(javax.naming.Context.SECURITY_CREDENTIALS))) {
+                    throw new AuthenticationException("[LDAP: error code 49 - Invalid Credentials]");
+                }
+            }
+            // Any other mechanism (none, EXTERNAL, ...) ignores the password
+            return new BasicAttributes(true);
+        }
     }
 }
