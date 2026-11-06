@@ -147,6 +147,37 @@ public class TestStreamSni {
 
 
     @Test
+    public void testHostHeaderDoesNotMatchSniIsRejected() throws Exception {
+        // No :authority so the Host header is the authority
+        Stream stream = startRequest(createHandler("localhost", true, true));
+        try {
+            stream.emitHeader("host", "foobar");
+            Assert.fail("The Host [foobar] must not be accepted with the SNI host name [localhost]");
+        } catch (HpackException expected) {
+            // Expected
+        }
+    }
+
+    @Test
+    public void testHostHeaderMatchesSniIsAllowed() throws Exception {
+        Stream stream = startRequest(createHandler("localhost", true, true));
+        stream.emitHeader("host", "localhost:8443");
+        Assert.assertEquals("localhost", stream.getCoyoteRequest().serverName().toString());
+        Assert.assertEquals(8443, stream.getCoyoteRequest().getServerPort());
+        // The Host header is still a request header
+        Assert.assertEquals("localhost:8443", stream.getCoyoteRequest().getMimeHeaders().getHeader("host"));
+    }
+
+    @Test
+    public void testAuthorityIsUsedWhenHostIsAlsoPresent() throws Exception {
+        Stream stream = startRequest(createHandler("localhost", true, true));
+        stream.emitHeader(":authority", "localhost");
+        // Not used as the authority and so not matched with the SNI host name
+        stream.emitHeader("host", "foobar");
+        Assert.assertEquals("localhost", stream.getCoyoteRequest().serverName().toString());
+    }
+
+    @Test
     public void testSameSslHostConfigIsAllowed() throws Exception {
         // Neither name has a dedicated configuration so both use the default
         Stream stream = startRequest(createHandler("unknown1", true, true));

@@ -385,6 +385,35 @@ class Stream extends AbstractStream implements HeaderEmitter {
             headerState = HEADER_STATE_REGULAR;
         }
 
+        if (headerState == HEADER_STATE_REGULAR && coyoteRequest.serverName().isNull() && "host".equals(name)) {
+            // No :authority so use the first Host header as the authority (the
+            // Host header is still added to the request headers below). Without
+            // an authority there is no host name to compare with the SNI host
+            // name (strictSni).
+            int i = -1;
+            boolean valid = true;
+            try {
+                i = Host.parse(value);
+            } catch (IllegalArgumentException iae) {
+                // Invalid Host value. Leave the authority unset so that the
+                // request is rejected when the headers are validated.
+                valid = false;
+            }
+            if (valid) {
+                if (i > -1) {
+                    coyoteRequest.serverName().setString(value.substring(0, i));
+                    coyoteRequest.setServerPort(Integer.parseInt(value.substring(i + 1)));
+                } else {
+                    coyoteRequest.serverName().setString(value);
+                }
+                if (!handler.getProtocol().getHttp11Protocol().checkSni(handler.getSniHostName(),
+                        coyoteRequest.serverName().getString())) {
+                    throw new HpackException(sm.getString("stream.host.sni", getConnectionId(),
+                            getIdentifier(), value, handler.getSniHostName()));
+                }
+            }
+        }
+
         switch (name) {
         case ":method": {
             if (coyoteRequest.method().isNull()) {
@@ -517,6 +546,14 @@ class Stream extends AbstractStream implements HeaderEmitter {
                 coyoteRequest.requestURI().isNull()) {
             throw new ConnectionException(sm.getString("stream.header.required",
                     getConnectionId(), getIdentifier()), Http2Error.PROTOCOL_ERROR);
+        }
+        if (coyoteRequest.serverName().isNull()) {
+            // Neither :authority nor Host. Every request needs an authority so
+            // that it can be matched with the SNI host name (strictSni). Reset
+            // the stream, as upstream does, rather than the connection.
+            close(new StreamException(sm.getString("stream.header.required",
+                    getConnectionId(), getIdentifier()), Http2Error.PROTOCOL_ERROR, getIdAsInt()));
+            return false;
         }
         // Cookie headers need to be concatenated into a single header
         // See RFC 7540 8.1.2.5

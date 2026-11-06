@@ -199,6 +199,43 @@ public class TestHttp2Section_8_1 extends Http2TestBase {
     }
 
 
+    @Test
+    public void testMissingAuthority() throws Exception {
+        // Neither :authority nor Host so there is no host name to compare with
+        // the SNI host name (strictSni). The stream, not the connection, is reset.
+        List<Header> headers = new ArrayList<>(3);
+        headers.add(new Header(":method", "GET"));
+        headers.add(new Header(":scheme", "http"));
+        headers.add(new Header(":path", "/simple"));
+
+        doInvalidPseudoHeaderTest(headers);
+    }
+
+
+    @Test
+    public void testHostHeaderWithoutAuthority() throws Exception {
+        // A Host header is accepted in place of :authority
+        http2Connect();
+
+        List<Header> headers = new ArrayList<>(4);
+        headers.add(new Header(":method", "GET"));
+        headers.add(new Header(":scheme", "http"));
+        headers.add(new Header(":path", "/simple"));
+        headers.add(new Header("host", "localhost:" + getPort()));
+
+        byte[] headersFrameHeader = new byte[9];
+        ByteBuffer headersPayload = ByteBuffer.allocate(128);
+
+        buildGetRequest(headersFrameHeader, headersPayload, null, headers, 3);
+
+        writeFrame(headersFrameHeader, headersPayload);
+
+        readSimpleGetResponse();
+
+        Assert.assertEquals(getSimpleResponseTrace(3), output.getTrace());
+    }
+
+
     private void doInvalidPseudoHeaderTest(List<Header> headers) throws Exception {
         http2Connect();
 
