@@ -46,6 +46,7 @@ import org.apache.tomcat.util.net.ApplicationBufferHandler;
 import org.apache.tomcat.util.net.SSLSupport;
 import org.apache.tomcat.util.net.SocketWrapperBase;
 import org.apache.tomcat.util.res.StringManager;
+import org.apache.tomcat.util.security.ConstantTime;
 
 /**
  * AJP Processor implementation.
@@ -803,7 +804,7 @@ public class AjpProcessor extends AbstractProcessor {
                 requestHeaderMessage.getBytes(tmpMB);
                 if (requiredSecret != null) {
                     secret = true;
-                    if (!tmpMB.equals(requiredSecret)) {
+                    if (!ConstantTime.equals(tmpMB.getByteChunk(), requiredSecret)) {
                         response.setStatus(403);
                         setErrorState(ErrorState.CLOSE_CLEAN, null);
                     }

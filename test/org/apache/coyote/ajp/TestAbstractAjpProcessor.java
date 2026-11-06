@@ -547,6 +547,77 @@ public class TestAbstractAjpProcessor extends TomcatBaseTest {
         ajpClient.disconnect();
     }
 
+    /*
+     * Regression test for CVE-2026-43514. The AJP secret has to be compared
+     * using an algorithm that always examines every byte of the supplied secret
+     * so that the time taken does not leak how much of the secret was correct.
+     *
+     * The secrets used below are the ones an attacker mounting a timing attack
+     * would use: values that share an increasing prefix with the real secret
+     * plus values that are shorter and longer than the real secret. All of them
+     * must be rejected while the correct secret is still accepted. Note the
+     * secret never starts at the beginning of the AJP packet so the comparison
+     * has to allow for the offset of the secret within the packet buffer.
+     */
+    @Test
+    public void testSecretConstantTime() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Assert.assertTrue(tomcat.getConnector().setProperty("requiredSecret", "RIGHTSECRET"));
+        tomcat.start();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        Tomcat.addServlet(ctx, "helloWorld", new HelloWorldServlet());
+        ctx.addServletMappingDecoded("/", "helloWorld");
+
+        SimpleAjpClient ajpClient = new SimpleAjpClient();
+        ajpClient.setPort(getPort());
+
+        // Correct length, no correct characters
+        doTestSecret(ajpClient, "XXXXXXXXXXX", false);
+        // Correct length, first character correct
+        doTestSecret(ajpClient, "RXXXXXXXXXX", false);
+        // Correct length, all but the last character correct
+        doTestSecret(ajpClient, "RIGHTSECREX", false);
+        // Shorter than the correct secret but a prefix of it
+        doTestSecret(ajpClient, "RIGHTSECRE", false);
+        // Longer than the correct secret but starts with it
+        doTestSecret(ajpClient, "RIGHTSECRETX", false);
+        // Zero length secret
+        doTestSecret(ajpClient, "", false);
+        // The correct secret
+        doTestSecret(ajpClient, "RIGHTSECRET", true);
+    }
+
+
+    private void doTestSecret(SimpleAjpClient ajpClient, String secret, boolean expectAccepted)
+            throws Exception {
+
+        ajpClient.connect();
+        try {
+            validateCpong(ajpClient.cping());
+
+            TesterAjpMessage forwardMessage = ajpClient.createForwardMessage();
+            forwardMessage.addAttribute(Constants.SC_A_SECRET, secret);
+            forwardMessage.end();
+
+            TesterAjpMessage responseHeaders = ajpClient.sendMessage(forwardMessage);
+            // Expect 3 packets: headers, body, end
+            if (expectAccepted) {
+                validateResponseHeaders(responseHeaders, 200, "200");
+                validateResponseBody(ajpClient.readMessage(), HelloWorldServlet.RESPONSE_TEXT);
+                validateResponseEnd(ajpClient.readMessage(), true);
+            } else {
+                validateResponseHeaders(responseHeaders, 403, "403");
+                validateResponseBody(ajpClient.readMessage(), "<p><b>Type</b> Status Report</p>");
+                validateResponseEnd(ajpClient.readMessage(), false);
+            }
+        } finally {
+            ajpClient.disconnect();
+        }
+    }
+
     @Test
     public void testKeepAlive() throws Exception {
         Tomcat tomcat = getTomcatInstance();
