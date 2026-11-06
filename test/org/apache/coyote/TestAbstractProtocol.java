@@ -92,6 +92,17 @@ public class TestAbstractProtocol {
 
 
     /**
+     * Direct HTTP/2 connection ({@code upgradeToken == null}): the leftover
+     * input must be copied out of the HTTP/1.1 processor before that processor
+     * is released into the shared pool.
+     */
+    @Test
+    public void testLeftoverInputNotMixedUpOnDirectHttp2Upgrade() throws Exception {
+        doTestLeftoverInputNotMixedUp(false);
+    }
+
+
+    /**
      * HTTP upgrade token present ({@code upgradeToken != null}, e.g. an
      * {@code Upgrade: h2c} request or a Servlet API upgrade): the leftover input
      * must be copied out of the HTTP/1.1 processor before that processor is

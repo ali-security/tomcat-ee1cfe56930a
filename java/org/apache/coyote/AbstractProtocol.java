@@ -874,6 +874,9 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
                             // Assume direct HTTP/2 connection
                             UpgradeProtocol upgradeProtocol = getProtocol().getUpgradeProtocol("h2c");
                             if (upgradeProtocol != null) {
+                                // Release the Http11 processor to be re-used
+                                release(processor);
+                                // Create the upgrade processor
                                 processor = upgradeProtocol.getProcessor(
                                         wrapper, getProtocol().getAdapter());
                                 // Associate with the processor with the connection
