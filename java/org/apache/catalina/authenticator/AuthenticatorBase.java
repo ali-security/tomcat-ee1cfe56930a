@@ -21,6 +21,7 @@ import java.security.Principal;
 import java.security.cert.X509Certificate;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -544,33 +545,10 @@ public abstract class AuthenticatorBase extends ValveBase
 
         // Make sure that constrained resources are not cached by web proxies
         // or browsers as caching can provide a security hole
-        if (constraints != null && disableProxyCaching &&
-                !"POST".equalsIgnoreCase(request.getMethod())) {
-            if (securePagesWithPragma) {
-                // Note: These can cause problems with downloading files with IE
-                response.setHeader("Pragma", "No-cache");
-                response.setHeader("Cache-Control", "no-cache");
-            } else {
-                response.setHeader("Cache-Control", "private");
-            }
-            response.setHeader("Expires", DATE_ONE);
-        }
+        disableCaching(constraints, request, response);
 
-        if (constraints != null) {
-            // Enforce any user data constraint for this security constraint
-            if (log.isDebugEnabled()) {
-                log.debug("Calling hasUserDataPermission()");
-            }
-            if (!realm.hasUserDataPermission(request, response, constraints)) {
-                if (log.isDebugEnabled()) {
-                    log.debug("Failed hasUserDataPermission() test");
-                }
-                /*
-                 * ASSERT: Authenticator already set the appropriate HTTP status
-                 * code, so we do not have to do anything special
-                 */
-                return;
-            }
+        if (!checkUserDataConstraints(realm, constraints, request, response)) {
+            return;
         }
 
         // Since authenticate modifies the response on failure,
@@ -628,6 +606,13 @@ public abstract class AuthenticatorBase extends ValveBase
                 }
             }
 
+            /*
+             * The HTTP method is one of the request properties used to select
+             * the security constraints that apply to this request, so it has
+             * to be captured before authentication runs. See below.
+             */
+            String methodBeforeAuthentication = request.getMethod();
+
             if (jaspicProvider == null && !doAuthenticate(request, response) ||
                     jaspicProvider != null &&
                             !authenticateJaspic(request, response, jaspicState, false)) {
@@ -639,6 +624,29 @@ public abstract class AuthenticatorBase extends ValveBase
                  * code, so we do not have to do anything special
                  */
                 return;
+            }
+
+            /*
+             * Authentication may have replaced the current request with a
+             * saved one - FORM authentication restores the request that
+             * triggered the login once the user has authenticated - and the
+             * restored request may use a different HTTP method. Since the
+             * security constraints for this request were selected using the
+             * method of the request as received, they have to be
+             * recalculated, and re-enforced, whenever the method changes.
+             * Otherwise a request could be processed with the constraints of
+             * a method it no longer uses.
+             */
+            if (!Objects.equals(methodBeforeAuthentication, request.getMethod())) {
+                // Recalculate constraints since the request has changed
+                constraints = realm.findSecurityConstraints(request, this.context);
+                // Re-check if caching needs to be disabled since the request
+                // (and maybe constraints) have changed
+                disableCaching(constraints, request, response);
+                // Re-check user data constraints as constraints may have changed
+                if (!checkUserDataConstraints(realm, constraints, request, response)) {
+                    return;
+                }
             }
 
         }
@@ -668,6 +676,44 @@ public abstract class AuthenticatorBase extends ValveBase
         if (jaspicProvider != null) {
             secureResponseJspic(request, response, jaspicState);
         }
+    }
+
+
+    private void disableCaching(SecurityConstraint[] constraints, Request request, Response response) {
+        // Only disable caching where necessary
+        if (constraints != null && disableProxyCaching &&
+                !"POST".equalsIgnoreCase(request.getMethod())) {
+            if (securePagesWithPragma) {
+                // Note: These can cause problems with downloading files with IE
+                response.setHeader("Pragma", "No-cache");
+                response.setHeader("Cache-Control", "no-cache");
+            } else {
+                response.setHeader("Cache-Control", "private");
+            }
+            response.setHeader("Expires", DATE_ONE);
+        }
+    }
+
+
+    private boolean checkUserDataConstraints(Realm realm, SecurityConstraint[] constraints,
+            Request request, Response response) throws IOException {
+        if (constraints != null) {
+            // Enforce any user data constraint for this security constraint
+            if (log.isDebugEnabled()) {
+                log.debug("Calling hasUserDataPermission()");
+            }
+            if (!realm.hasUserDataPermission(request, response, constraints)) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Failed hasUserDataPermission() test");
+                }
+                /*
+                 * ASSERT: Authenticator already set the appropriate HTTP status
+                 * code, so we do not have to do anything special
+                 */
+                return false;
+            }
+        }
+        return true;
     }
 
 

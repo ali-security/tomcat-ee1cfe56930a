@@ -637,7 +637,8 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
                 for(int k=0; k < patterns.length; k++) {
                     String pattern = patterns[k];
                     if(pattern.startsWith("/") && pattern.endsWith("/*") &&
-                       pattern.length() >= longest) {
+                       pattern.length() >= longest &&
+                       pattern.length() >= length) {
 
                         if(pattern.length() == 2) {
                             matched = true;
