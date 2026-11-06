@@ -763,6 +763,11 @@ public class Http11Processor extends AbstractProcessor {
         // Validate host name and extract port if present
         parseHost(hostValueMB);
 
+        // Match host name with SNI if required
+        if (!protocol.checkSni(socketWrapper.getSniHostName(), request.serverName().toString())) {
+            badRequest("http11processor.request.sni");
+        }
+
         if (!contentDelimitation) {
             // If there's no content length
             // (broken HTTP/1.0 or HTTP/1.1), assume

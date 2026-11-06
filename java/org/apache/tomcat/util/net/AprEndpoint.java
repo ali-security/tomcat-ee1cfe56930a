@@ -83,6 +83,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
     private static final Log log = LogFactory.getLog(AprEndpoint.class);
 
+    private static final ThreadLocal<SocketWrapperBase<Long>> localWrapper = new ThreadLocal<>();
+
     // ----------------------------------------------------------------- Fields
 
     /**
@@ -417,6 +419,10 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
 
     @Override
     public long getSslContext(String sniHostName) {
+        SocketWrapperBase<Long> socketWrapper = localWrapper.get();
+        if (socketWrapper != null) {
+            socketWrapper.setSniHostName(sniHostName);
+        }
         SSLHostConfig sslHostConfig = getSSLHostConfig(sniHostName);
         Long ctx = sslHostConfig.getOpenSslContext();
         if (ctx != null) {
@@ -606,11 +612,16 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
             step = 2;
             if (sslContext != 0) {
                 SSLSocket.attach(sslContext, socket);
-                if (SSLSocket.handshake(socket) != 0) {
-                    if (log.isDebugEnabled()) {
-                        log.debug(sm.getString("endpoint.err.handshake") + ": " + SSL.getLastError());
+                localWrapper.set(socketWrapper);
+                try {
+                    if (SSLSocket.handshake(socket) != 0) {
+                        if (log.isDebugEnabled()) {
+                            log.debug(sm.getString("endpoint.err.handshake") + ": " + SSL.getLastError());
+                        }
+                        return false;
                     }
-                    return false;
+                } finally {
+                    localWrapper.set(null);
                 }
 
                 if (negotiableProtocols.size() > 0) {

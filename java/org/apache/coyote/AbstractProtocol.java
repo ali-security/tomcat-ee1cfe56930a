@@ -400,6 +400,10 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
     }
 
 
+    public boolean checkSni(String sniHostName, String protocolHostName) {
+        return getEndpoint().checkSni(sniHostName, protocolHostName);
+    }
+
     // ----------------------------------------------- Accessors for sub-classes
 
     protected AbstractEndpoint<S,?> getEndpoint() {
