@@ -1,0 +1,313 @@
+# Sealed-libraries build of Apache Tomcat 9.0.30 (tomcat-embed-core).
+# Upstream Tomcat 9.0.30 ships no GitHub Actions CI (and no .travis.yml), so this
+# workflow is authored from the project's own build.xml / BUILDING.txt:
+#   build: `ant package embed-jars`        (embed-jars needs annotations-api.jar from package)
+#   test:  `ant test-nio|test-nio2|test-apr ... test-status`  (= `ant test`, one connector per leg)
+# Toolchain matches the release: JDK 8 (compile.release=8, public jar Created-By 1.8.0_232)
+# and Ant 1.9.14 (public jar Ant-Version), tomcat-native 1.2.23 (build.properties.default).
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated test class names (e.g. TestRequest TestHttp11InputBuffer); empty = full suite"
+        required: false
+        default: ""
+
+env:
+  ANT_VERSION: "1.9.14"
+  JAVA_VERSION: "8.0.372+7"
+  OPENSSL_VERSION: "1.1.1w"
+  TCNATIVE_VERSION: "1.2.23"
+  TCNATIVE_SHA512: "89a0363961d322a87f4e752f4727f54f28ac6e4ad10fa21b6b7390c62b041d4068672d95495d9233c1cad7d6c1dc3c85fbd0186894085b3b94e476876af160ee"
+  LC_ALL: C.UTF-8
+  LANG: C.UTF-8
+  ANT_OPTS: "-Xmx2g"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install Ant ${{ env.ANT_VERSION }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/ant.tgz" "https://archive.apache.org/dist/ant/binaries/apache-ant-${ANT_VERSION}-bin.tar.gz"
+          tar -xzf "$RUNNER_TEMP/ant.tgz" -C "$RUNNER_TEMP"
+          # The runner image exports ANT_HOME for its own Ant; override it so the 1.9.14 launcher really runs 1.9.14.
+          echo "ANT_HOME=$RUNNER_TEMP/apache-ant-${ANT_VERSION}" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/apache-ant-${ANT_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Build (ant package embed-jars)
+        run: |
+          echo "base.path=$RUNNER_TEMP/tomcat-build-libs" > build.properties
+          ant -version
+          java -version
+          ant -noinput package embed-jars
+          mkdir -p seal-dist
+          cp output/embed/tomcat-embed-core.jar seal-dist/tomcat-embed-core-9.0.30.jar
+          ls -l seal-dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tomcat-embed-core-9.0.30
+          path: seal-dist/tomcat-embed-core-9.0.30.jar
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        connector: [nio, nio2, apr]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install Ant ${{ env.ANT_VERSION }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/ant.tgz" "https://archive.apache.org/dist/ant/binaries/apache-ant-${ANT_VERSION}-bin.tar.gz"
+          tar -xzf "$RUNNER_TEMP/ant.tgz" -C "$RUNNER_TEMP"
+          echo "ANT_HOME=$RUNNER_TEMP/apache-ant-${ANT_VERSION}" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/apache-ant-${ANT_VERSION}/bin" >> "$GITHUB_PATH"
+
+      # TestCipher / TestOpenSSLCipherConfigurationParser compare against an `openssl` binary and
+      # 9.0.30's expectations are OpenSSL 1.1.1-era; tomcat-native 1.2.23 also only builds on 1.1.1.
+      - name: Build OpenSSL ${{ env.OPENSSL_VERSION }}
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libapr1-dev build-essential
+          P="$RUNNER_TEMP/openssl-1.1.1"
+          curl -fsSL -o "$RUNNER_TEMP/openssl.tgz" "https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/openssl.tgz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
+          ./config --prefix="$P" --openssldir="$P/ssl" shared -Wl,-rpath,"$P/lib" > /dev/null
+          make -j"$(nproc)" > /dev/null 2>&1
+          make install_sw > /dev/null 2>&1
+          "$P/bin/openssl" version
+
+      # The APR connector leg and the APR-assuming tests on every leg (TestSSLHostConfigCompat,
+      # jni TestFile/TestSocketServer) need the tomcat-native library this release pins.
+      - name: Build tomcat-native ${{ env.TCNATIVE_VERSION }}
+        run: |
+          T="$RUNNER_TEMP/tcnative"
+          curl -fsSL -o "$RUNNER_TEMP/tcn.tgz" "https://archive.apache.org/dist/tomcat/tomcat-connectors/native/${TCNATIVE_VERSION}/source/tomcat-native-${TCNATIVE_VERSION}-src.tar.gz"
+          echo "${TCNATIVE_SHA512}  $RUNNER_TEMP/tcn.tgz" | sha512sum -c -
+          tar -xzf "$RUNNER_TEMP/tcn.tgz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/tomcat-native-${TCNATIVE_VERSION}-src/native"
+          ./configure --with-apr=/usr/bin/apr-1-config --with-java-home="$JAVA_HOME" \
+            --with-ssl="$RUNNER_TEMP/openssl-1.1.1" --prefix="$T" \
+            LDFLAGS="-Wl,-rpath,$RUNNER_TEMP/openssl-1.1.1/lib" > /dev/null
+          make -j"$(nproc)" > /dev/null
+          make install > /dev/null
+          ls -l "$T/lib"
+
+      # The test PKI committed in 9.0.30 (test/org/apache/tomcat/util/net) has expired, which makes
+      # the JSSE/OpenSSL TLS tests fail. Regenerate the same PKI (same DNs/SANs, aliases ca/tomcat/user1,
+      # storepass changeit, copy1 keypass tomcatpass) with long validity. Test-only files, never in the jar.
+      # Keys are PKCS#8 (genpkey): 9.0.30's PEMFile rejects SEC1 "EC PRIVATE KEY".
+      - name: Regenerate expired test certificates
+        working-directory: test/org/apache/tomcat/util/net
+        run: |
+          DN='/C=US/ST=MA/L=Wakefield/O=The Apache Software Foundation/OU=Apache Tomcat PMC'
+          SP=changeit; KP=tomcatpass; DAYS=7300; SAN='subjectAltName=DNS:localhost,IP:127.0.0.1'
+          tmp=$(mktemp -d)
+          openssl req -x509 -newkey rsa:4096 -sha256 -days $DAYS -nodes \
+            -keyout "$tmp/ca-key.pem" -out ca-cert.pem -subj "$DN/CN=Apache Tomcat Test CA"
+          rm -f ca.jks
+          keytool -importcert -noprompt -storetype JKS -alias ca -file ca-cert.pem -keystore ca.jks -storepass $SP
+          leaf() {
+            local name=$1 alg=$2 cn=$3 ext=${4:-}
+            if [ "$alg" = ec ]; then
+              openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 -out ${name}-key.pem
+            else
+              openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out ${name}-key.pem
+            fi
+            local extf="$tmp/$name.ext"
+            printf 'basicConstraints=CA:FALSE\n' > "$extf"
+            if [ -n "$ext" ]; then printf '%s\n' "$ext" >> "$extf"; fi
+            openssl req -new -key ${name}-key.pem -sha256 -subj "$DN/CN=$cn" -out "$tmp/$name.csr"
+            openssl x509 -req -in "$tmp/$name.csr" -CA ca-cert.pem -CAkey "$tmp/ca-key.pem" \
+              -CAcreateserial -sha256 -days $DAYS -extfile "$extf" -out ${name}-cert.pem
+          }
+          jks() {
+            local name=$1 alias=$2 store=$3 keypass=$4
+            cat ${name}-cert.pem ca-cert.pem > "$tmp/$name-chain.pem"
+            openssl pkcs12 -export -in "$tmp/$name-chain.pem" -inkey ${name}-key.pem -name $alias \
+              -passout pass:$SP -out "$tmp/$name.p12"
+            rm -f "$store"
+            keytool -importkeystore -noprompt -srckeystore "$tmp/$name.p12" -srcstoretype PKCS12 \
+              -srcstorepass $SP -srcalias $alias -destkeystore "$store" -deststoretype JKS \
+              -deststorepass $SP -destkeypass $keypass -destalias $alias
+          }
+          leaf localhost-rsa rsa localhost "$SAN"
+          leaf localhost-ec ec localhost "$SAN"
+          leaf user1 rsa user1 ""
+          jks localhost-rsa tomcat localhost-rsa.jks $SP
+          jks localhost-ec tomcat localhost-ec.jks $SP
+          jks user1 user1 user1.jks $SP
+          jks localhost-rsa tomcat localhost-rsa-copy1.jks $KP
+          # TestCrlSupport: user2 (user2-crl.jks) is revoked in populated-crl.pem; empty-crl.pem revokes nothing.
+          leaf user2 rsa user2 ""
+          jks user2 user2 user2-crl.jks $SP
+          : > "$tmp/index.txt"
+          echo 1000 > "$tmp/crlnumber"
+          printf '[ca]\ndefault_ca=crl_ca\n[crl_ca]\ndatabase=%s\ncrlnumber=%s\ndefault_md=sha256\ndefault_crl_days=%s\n' \
+            "$tmp/index.txt" "$tmp/crlnumber" "$DAYS" > "$tmp/crl.cnf"
+          crl() { openssl ca -config "$tmp/crl.cnf" -cert ca-cert.pem -keyfile "$tmp/ca-key.pem" "$@"; }
+          crl -gencrl -out empty-crl.pem
+          crl -revoke user2-cert.pem
+          crl -gencrl -out populated-crl.pem
+          openssl verify -crl_check -CAfile ca-cert.pem -CRLfile empty-crl.pem user2-cert.pem
+          if openssl verify -crl_check -CAfile ca-cert.pem -CRLfile populated-crl.pem user2-cert.pem; then
+            echo "populated-crl.pem does not revoke user2"; exit 1
+          fi
+          rm -f ca-cert.srl user1-cert.pem user1-key.pem user2-cert.pem user2-key.pem
+          rm -rf "$tmp"
+          openssl x509 -in localhost-rsa-cert.pem -noout -subject -enddate
+
+      - name: Configure build.properties (${{ matrix.connector }} connector)
+        run: |
+          C="${{ matrix.connector }}"
+          on() { [ "$C" = "$1" ] && echo true || echo false; }
+          cat > build.properties <<EOF
+          base.path=$RUNNER_TEMP/tomcat-build-libs
+          execute.test.nio=$(on nio)
+          execute.test.nio2=$(on nio2)
+          execute.test.apr=$(on apr)
+          test.apr.loc=$RUNNER_TEMP/tcnative/lib
+          test.openssl.path=$RUNNER_TEMP/openssl-1.1.1/bin/openssl
+          test.threads=4
+          test.verbose=false
+          EOF
+          sed -i 's/^ *//' build.properties
+          cat build.properties
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/tcnative/lib:$RUNNER_TEMP/openssl-1.1.1/lib" >> "$GITHUB_ENV"
+
+      # Full suite (== `ant test` restricted to this leg's connector). Performance suites are
+      # run in the next step with test.threads=1, as their timing thresholds assume an idle host.
+      - name: Test (${{ matrix.connector }})
+        run: |
+          ant -version
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            names=""
+            for c in ${{ inputs.test-filter }}; do names="$names **/$c.java"; done
+            ant -noinput test-${{ matrix.connector }} test-status -Dtest.name="$names"
+          else
+            ant -noinput test-${{ matrix.connector }} test-status -Dtest.excludePerformance=true
+          fi
+
+      - name: Test Performance suites serially (${{ matrix.connector }})
+        if: ${{ inputs.test-filter == '' }}
+        run: |
+          ant -noinput test-${{ matrix.connector }} test-status -Dtest.threads=1 \
+            -Dtest.name="**/Test*Performance.java"
+
+      - name: Test summary (${{ matrix.connector }})
+        if: always()
+        run: |
+          python3 - output/build/logs test <<'PY'
+          import glob, os, re, sys
+          logs, srcroot = sys.argv[1], sys.argv[2]
+          files = sorted(glob.glob(os.path.join(logs, "TEST-*.txt")))
+          tot = dict(suites=0, tests=0, fail=0, err=0, skip=0)
+          skips, bad = [], []
+
+          def src_reason(cls, meth):
+              path = os.path.join(srcroot, cls.split("$")[0].replace(".", "/") + ".java")
+              if not os.path.exists(path):
+                  return "source not found"
+              lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+              meth = re.sub(r"\[.*\]$", "", meth)
+              def ann(idx):
+                  out = []
+                  j = idx - 1
+                  while j >= 0 and j >= idx - 12:
+                      s = lines[j].strip()
+                      if s.startswith("@") or s.startswith("//") or s.startswith("*") or s.startswith("/*"):
+                          out.insert(0, s)
+                          j -= 1
+                          continue
+                      break
+                  return out
+              for i, l in enumerate(lines):
+                  if re.search(r"\bvoid\s+" + re.escape(meth) + r"\s*\(", l):
+                      a = ann(i)
+                      if any(x.startswith("@Ignore") for x in a):
+                          return "@Ignore on method: " + " ".join(a)
+                      body = []
+                      for k in range(i + 1, min(len(lines), i + 80)):
+                          if re.match(r"^    (public|private|protected|@)", lines[k]):
+                              break
+                          if re.search(r"Assume\.|assume[A-Z]", lines[k]):
+                              body.append(lines[k].strip())
+                      if body:
+                          return "assumption not met: " + " | ".join(body)
+                      break
+              for i, l in enumerate(lines):
+                  if re.search(r"\bclass\s+" + re.escape(cls.split(".")[-1].split("$")[0]) + r"\b", l):
+                      a = ann(i)
+                      if any(x.startswith("@Ignore") for x in a):
+                          return "@Ignore on class: " + " ".join(a)
+                      break
+              asm = [l.strip() for l in lines if re.search(r"Assume\.|assume[A-Z]", l)]
+              if asm:
+                  return "assumption in class setup not met: " + " | ".join(asm[:3])
+              return "no reason given in source"
+
+          for f in files:
+              txt = open(f, encoding="utf-8", errors="replace").read()
+              m = re.search(r"^Testsuite: (\S+)", txt, re.M)
+              s = re.search(r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", txt)
+              if not m or not s:
+                  bad.append(os.path.basename(f))
+                  continue
+              suite = m.group(1)
+              t, fa, er, sk = map(int, s.groups())
+              tot["suites"] += 1; tot["tests"] += t; tot["fail"] += fa; tot["err"] += er; tot["skip"] += sk
+              print(f"SUITE {suite} tests={t} failures={fa} errors={er} skipped={sk}")
+              cur = None
+              tl = txt.splitlines()
+              for i, line in enumerate(tl):
+                  mc = re.match(r"^Testcase: (.+?) took ", line)
+                  if mc:
+                      cur = mc.group(1)
+                      continue
+                  ms = re.match(r"^\s+SKIPPED:?\s*(.*)$", line)
+                  if ms and cur is not None:
+                      msg = ms.group(1).strip()
+                      if not msg or re.match(r"^(got: |Expected: |AssumptionViolated|null$)", msg):
+                          extra = src_reason(suite, cur)
+                          msg = (msg + " -- " if msg else "") + extra
+                      skips.append(f"SKIPPED {suite} :: {cur} -- reason: {msg}")
+                  if re.match(r"^\s+(FAILED|Caused an ERROR)", line) and cur is not None:
+                      detail = tl[i + 1].strip() if i + 1 < len(tl) else ""
+                      print(f"FAILED {suite} :: {cur} -- {detail}")
+          print()
+          print("=== Skipped tests (with reasons) ===")
+          for s in skips:
+              print(s)
+          if bad:
+              print("Unparsed report files:", " ".join(bad))
+          passed = tot["tests"] - tot["fail"] - tot["err"] - tot["skip"]
+          print()
+          print(f"TOTALS connector=${{ matrix.connector }} suites={tot['suites']} tests={tot['tests']} passed={passed} "
+                f"failures={tot['fail']} errors={tot['err']} skipped={tot['skip']}")
+          if tot["tests"] == 0:
+              print("ERROR: no tests were executed")
+              sys.exit(1)
+          if tot["fail"] or tot["err"]:
+              sys.exit(1)
+          PY
