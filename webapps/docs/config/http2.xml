@@ -221,6 +221,13 @@
       used.</p>
     </attribute>
 
+    <attribute name="overheadResetFactor" required="false">
+      <p>The amount by which the overhead count (see
+      <strong>overheadCountFactor</strong>) will be increased for each reset
+      frame received. If not specified, a default value of <code>3</code> will
+      be used. A value of less than zero will be treated as zero.</p>
+    </attribute>
+
     <attribute name="overheadDataThreshold" required="false">
       <p>The threshold below which the average payload size of the current and
       previous non-final <code>DATA</code> frames will trigger an increase in

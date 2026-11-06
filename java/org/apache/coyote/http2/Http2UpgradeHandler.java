@@ -350,11 +350,12 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
                             } else {
                                 stream.close(se);
                             }
-                        }
-                        if (overheadCount.get() > 0) {
-                            throw new ConnectionException(
-                                    sm.getString("upgradeHandler.tooMuchOverhead", connectionId),
-                                    Http2Error.ENHANCE_YOUR_CALM);
+                        } finally {
+                            if (isOverheadLimitExceeded()) {
+                                throw new ConnectionException(
+                                        sm.getString("upgradeHandler.tooMuchOverhead", connectionId),
+                                        Http2Error.ENHANCE_YOUR_CALM);
+                            }
                         }
                     }
 
@@ -1337,6 +1338,16 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
     }
 
 
+    private void increaseOverheadCount(int increment) {
+        overheadCount.addAndGet(increment);
+    }
+
+
+    boolean isOverheadLimitExceeded() {
+        return overheadCount.get() > 0;
+    }
+
+
     // ----------------------------------------------- Http2Parser.Input methods
 
     @Override
@@ -1577,6 +1588,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
 
     @Override
     public void reset(int streamId, long errorCode) throws Http2Exception  {
+        increaseOverheadCount(getProtocol().getOverheadResetFactor());
         Stream stream = getStream(streamId, true);
         stream.checkState(FrameType.RST);
         boolean active = stream.isActive();
